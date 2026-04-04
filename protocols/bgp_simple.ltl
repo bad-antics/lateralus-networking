@@ -1,0 +1,39 @@
+// BGP Route Parser
+module networking.protocols.bgp_simple
+
+pub struct BgpSimple {
+    host: str
+    port: int
+    connected: bool
+    stats: map
+}
+
+impl BgpSimple {
+    pub fn new(host: str, port: int) -> BgpSimple {
+        return BgpSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+    }
+    async pub fn connect(self) -> bool {
+        let result = await tcp_connect(self.host, self.port)
+        self.connected = result
+        return result
+    }
+    async pub fn send(self, data: str) -> int {
+        if not self.connected { throw Error("Not connected") }
+        let bytes_sent = await tcp_send(data)
+        self.stats["sent"] += bytes_sent
+        return bytes_sent
+    }
+    async pub fn receive(self, max_bytes: int) -> str {
+        if not self.connected { throw Error("Not connected") }
+        let data = await tcp_recv(max_bytes)
+        self.stats["received"] += len(data)
+        return data
+    }
+    pub fn disconnect(self) { self.connected = false }
+    pub fn get_stats(self) -> map { return self.stats }
+}
+
+async fn main() {
+    let conn = BgpSimple .new("127.0.0.1", 8080)
+    println("BGP Route Parser ready for host=" + conn.host + " port=" + conn.port as str)
+}
