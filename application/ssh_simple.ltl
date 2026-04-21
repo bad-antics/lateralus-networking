@@ -1,39 +1,55 @@
-// SSH Protocol (Simplified)
-module networking.application.ssh_simple
+// application/ssh_simple.ltl
+// SSHv2 binary packet framing and handshake flow (RFC 4253).
+//   uint32 packet_length | byte padding_length | payload | padding | mac
+// packet_length = len(payload) + len(padding) + 1, and
+// (packet_length + 4) must be a multiple of max(8, cipher_block_size).
 
-pub struct SshSimple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.ssh_simple
+
+pub const MSG_KEXINIT:         u8 = 20
+pub const MSG_NEWKEYS:         u8 = 21
+pub const MSG_KEXDH_INIT:      u8 = 30
+pub const MSG_KEXDH_REPLY:     u8 = 31
+pub const MSG_USERAUTH_REQUEST:u8 = 50
+
+pub struct Packet { packet_length: u32, padding_length: u8, payload: [u8], padding: [u8] }
+
+pub fn build_packet(payload: [u8], block_size: u64) -> [u8] {
+    let bs: u64 = if block_size < 8 { 8 } else { block_size }
+    // (4 + 1 + len(payload) + pad) % bs == 0;  pad >= 4.
+    let base: u64 = 4 + 1 + len(payload)
+    let mut pad: u64 = bs - (base % bs)
+    if pad < 4 { pad = pad + bs }
+    let packet_length: u32 = (1 + len(payload) + pad) as u32
+    let total: u64 = 4 + (packet_length as u64)
+    let mut buf: [u8] = u8_zeros(total)
+    buf[0] = ((packet_length >> 24) & 0xFF) as u8
+    buf[1] = ((packet_length >> 16) & 0xFF) as u8
+    buf[2] = ((packet_length >>  8) & 0xFF) as u8
+    buf[3] = ( packet_length        & 0xFF) as u8
+    buf[4] = pad as u8
+    let mut i: u64 = 0
+    while i < len(payload) { buf[5 + i] = payload[i]; i = i + 1 }
+    // zero padding is acceptable for demo (no encryption layer here).
+    return buf
 }
 
-impl SshSimple {
-    pub fn new(host: str, port: int) -> SshSimple {
-        return SshSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn parse_packet(buf: [u8]) -> Packet {
+    let pl: u32 = ((buf[0] as u32) << 24) | ((buf[1] as u32) << 16)
+                | ((buf[2] as u32) <<  8) |  (buf[3] as u32)
+    let pad: u8 = buf[4]
+    let plen: u64 = (pl as u64) - 1 - (pad as u64)
+    let mut payload: [u8] = u8_zeros(plen); let mut i: u64 = 0
+    while i < plen { payload[i] = buf[5 + i]; i = i + 1 }
+    let mut padding: [u8] = u8_zeros(pad as u64); i = 0
+    while i < (pad as u64) { padding[i] = buf[5 + plen + i]; i = i + 1 }
+    return Packet { packet_length: pl, padding_length: pad, payload: payload, padding: padding }
 }
 
-async fn main() {
-    let conn = SshSimple .new("127.0.0.1", 8080)
-    println("SSH Protocol (Simplified) ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn main() {
+    let body: [u8] = [MSG_KEXINIT, 0x10, 0x20, 0x30]
+    let wire: [u8] = build_packet(body, 8)
+    print("wire len=", len(wire))
+    let p: Packet = parse_packet(wire)
+    print("packet_length=", p.packet_length, " pad=", p.padding_length, " payload=", p.payload)
 }
