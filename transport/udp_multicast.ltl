@@ -1,39 +1,77 @@
-// UDP Multicast
-module networking.transport.udp_multicast
+// transport/udp_multicast.ltl
+// IPv4 multicast group membership (IGMPv2, RFC 2236).
+// Host keeps a set of joined groups; responds to queries by starting a
+// random-delay report timer; another host's report suppresses our own.
 
-pub struct UdpMulticast {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module transport.udp_multicast
+
+pub struct Membership { group: u32, timer: i64, has_reported: bool }
+pub struct Host { memberships: [Membership] }
+
+pub fn is_multicast(ip: u32) -> bool { return (ip >> 28) == 0xE }
+
+pub fn join(h: &mut Host, group: u32) -> bool {
+    if !is_multicast(group) { return false }
+    let mut i: u64 = 0
+    while i < len(h.memberships) { if h.memberships[i].group == group { return true }; i = i + 1 }
+    h.memberships.push(Membership { group: group, timer: -1, has_reported: false })
+    return true
 }
 
-impl UdpMulticast {
-    pub fn new(host: str, port: int) -> UdpMulticast {
-        return UdpMulticast { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn leave(h: &mut Host, group: u32) {
+    let mut i: u64 = 0
+    while i < len(h.memberships) {
+        if h.memberships[i].group == group { h.memberships.remove(i); return }
+        i = i + 1
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
 }
 
-async fn main() {
-    let conn = UdpMulticast .new("127.0.0.1", 8080)
-    println("UDP Multicast ready for host=" + conn.host + " port=" + conn.port as str)
+// On IGMP query with max response time `mrt` (in ticks), arm random timers.
+pub fn on_query(h: &mut Host, max_resp: u64, rand: u64) {
+    let mut i: u64 = 0
+    while i < len(h.memberships) {
+        let delay: i64 = ((rand + i) % max_resp) as i64
+        h.memberships[i].timer = delay
+        h.memberships[i].has_reported = false
+        i = i + 1
+    }
+}
+
+// Another host reported for `group`; suppress our pending report.
+pub fn on_peer_report(h: &mut Host, group: u32) {
+    let mut i: u64 = 0
+    while i < len(h.memberships) {
+        if h.memberships[i].group == group { h.memberships[i].timer = -1 }
+        i = i + 1
+    }
+}
+
+// Advance time by 1; return list of groups we must report now.
+pub fn tick(h: &mut Host) -> [u32] {
+    let mut out: [u32] = []
+    let mut i: u64 = 0
+    while i < len(h.memberships) {
+        if h.memberships[i].timer >= 0 {
+            h.memberships[i].timer = h.memberships[i].timer - 1
+            if h.memberships[i].timer < 0 {
+                out.push(h.memberships[i].group)
+                h.memberships[i].has_reported = true
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn main() {
+    let mut h: Host = Host { memberships: [] }
+    print("join 224.1.1.1 ok?", join(&mut h, 0xE0010101))
+    print("join 10.0.0.1  ok?", join(&mut h, 0x0A000001), " (expect false)")
+    on_query(&mut h, 10, 3)
+    let mut t: u64 = 0
+    while t < 10 {
+        let rpts: [u32] = tick(&mut h)
+        if len(rpts) > 0 { print("t=", t, " reporting=", rpts) }
+        t = t + 1
+    }
 }
