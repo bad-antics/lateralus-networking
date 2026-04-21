@@ -1,39 +1,66 @@
-// Honeypot
-module networking.security.honeypot
+// security/honeypot.ltl
+// Low-interaction TCP honeypot. Listens on decoy ports, replies with a
+// canned banner, records attacker timestamp/ip/port/bytes, and rate-limits
+// reconnections from the same source.
+
+module security.honeypot
+
+pub struct Interaction { t: u64, src_ip: u32, src_port: u16, port: u16, bytes_sent: u64, banner: str }
 
 pub struct Honeypot {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+    ports: [u16], banners: [str],       // parallel arrays
+    log: [Interaction], clock: u64,
+    per_src_limit: u64, seen: [(u32, u64)],
 }
 
-impl Honeypot {
-    pub fn new(host: str, port: int) -> Honeypot {
-        return Honeypot { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_honeypot(ports: [u16], banners: [str], limit: u64) -> Honeypot {
+    return Honeypot { ports: ports, banners: banners, log: [], clock: 0,
+                      per_src_limit: limit, seen: [] }
 }
 
-async fn main() {
-    let conn = Honeypot .new("127.0.0.1", 8080)
-    println("Honeypot ready for host=" + conn.host + " port=" + conn.port as str)
+fn count_src(h: Honeypot, src: u32) -> u64 {
+    let mut c: u64 = 0; let mut i: u64 = 0
+    while i < len(h.seen) { if h.seen[i].0 == src { c = h.seen[i].1 }; i = i + 1 }
+    return c
+}
+
+fn bump_src(h: &mut Honeypot, src: u32) {
+    let mut i: u64 = 0
+    while i < len(h.seen) {
+        if h.seen[i].0 == src { h.seen[i] = (src, h.seen[i].1 + 1); return }
+        i = i + 1
+    }
+    h.seen.push((src, 1))
+}
+
+fn banner_for(h: Honeypot, port: u16) -> str {
+    let mut i: u64 = 0
+    while i < len(h.ports) { if h.ports[i] == port { return h.banners[i] }; i = i + 1 }
+    return ""
+}
+
+// Handle incoming connection. Returns true if we served a banner, false if dropped.
+pub fn handle(h: &mut Honeypot, src: u32, src_port: u16, port: u16) -> bool {
+    h.clock = h.clock + 1
+    if count_src(*h, src) >= h.per_src_limit { return false }
+    let b: str = banner_for(*h, port)
+    if len(b) == 0 { return false }
+    h.log.push(Interaction { t: h.clock, src_ip: src, src_port: src_port,
+                             port: port, bytes_sent: len(str_to_bytes(b)), banner: b })
+    bump_src(h, src)
+    return true
+}
+
+pub fn main() {
+    let mut h: Honeypot = new_honeypot([22, 23, 2323],
+                                       ["SSH-2.0-OpenSSH_7.4\r\n",
+                                        "Login: ",
+                                        "Welcome to my router\r\n"], 3)
+    let attacker: u32 = 0xC0A80101
+    handle(&mut h, attacker, 54000, 22)
+    handle(&mut h, attacker, 54001, 23)
+    handle(&mut h, attacker, 54002, 2323)
+    let served: bool = handle(&mut h, attacker, 54003, 22)
+    print("4th connection served? ", served, " (expect false due to limit)")
+    print("log entries=", len(h.log))
 }
