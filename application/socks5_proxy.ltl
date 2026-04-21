@@ -1,39 +1,73 @@
-// SOCKS5 Proxy
-module networking.application.socks5_proxy
+// application/socks5_proxy.ltl
+// SOCKS5 protocol state machine from the server side (RFC 1928).
+// 1) Greeting:  VER(1) | NMETHODS(1) | METHODS(NMETHODS)
+//    Reply:      VER(1) | METHOD(1)
+// 2) Request :  VER(1) | CMD(1) | RSV(1) | ATYP(1) | DST.ADDR | DST.PORT(2)
+//    Reply:      VER(1) | REP(1) | RSV(1) | ATYP(1) | BND.ADDR | BND.PORT(2)
 
-pub struct Socks5Proxy {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.socks5_proxy
+
+pub const VER: u8 = 0x05
+pub const METHOD_NO_AUTH: u8 = 0x00
+pub const METHOD_NO_ACCEPTABLE: u8 = 0xFF
+pub const CMD_CONNECT: u8 = 0x01
+pub const ATYP_IPV4:   u8 = 0x01
+pub const ATYP_DOMAIN: u8 = 0x03
+pub const REP_OK:          u8 = 0x00
+pub const REP_CONN_REFUSED: u8 = 0x05
+pub const REP_HOST_UNREACH: u8 = 0x04
+
+pub fn pick_method(methods: [u8], supported: [u8]) -> u8 {
+    let mut i: u64 = 0
+    while i < len(supported) {
+        let s: u8 = supported[i]; let mut j: u64 = 0
+        while j < len(methods) { if methods[j] == s { return s }; j = j + 1 }
+        i = i + 1
+    }
+    return METHOD_NO_ACCEPTABLE
 }
 
-impl Socks5Proxy {
-    pub fn new(host: str, port: int) -> Socks5Proxy {
-        return Socks5Proxy { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn greet_reply(method: u8) -> [u8] { return [VER, method] }
+
+pub struct Socks5Req { cmd: u8, atyp: u8, addr_ipv4: u32, domain: str, port: u16, valid: bool }
+
+pub fn parse_request(buf: [u8]) -> Socks5Req {
+    if len(buf) < 7 || buf[0] != VER {
+        return Socks5Req { cmd: 0, atyp: 0, addr_ipv4: 0, domain: "", port: 0, valid: false }
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
+    let cmd: u8 = buf[1]
+    let atyp: u8 = buf[3]
+    if atyp == ATYP_IPV4 {
+        if len(buf) < 10 { return Socks5Req { cmd: 0, atyp: 0, addr_ipv4: 0, domain: "", port: 0, valid: false } }
+        let ip: u32 = ((buf[4] as u32) << 24) | ((buf[5] as u32) << 16)
+                    | ((buf[6] as u32) << 8)  |  (buf[7] as u32)
+        let port: u16 = ((buf[8] as u16) << 8) | (buf[9] as u16)
+        return Socks5Req { cmd: cmd, atyp: atyp, addr_ipv4: ip, domain: "", port: port, valid: true }
     }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
+    if atyp == ATYP_DOMAIN {
+        let dlen: u64 = buf[4] as u64
+        if len(buf) < 5 + dlen + 2 { return Socks5Req { cmd: 0, atyp: 0, addr_ipv4: 0, domain: "", port: 0, valid: false } }
+        let mut d: str = ""; let mut i: u64 = 0
+        while i < dlen { d = d + char_of(buf[5 + i]); i = i + 1 }
+        let port: u16 = ((buf[5 + dlen] as u16) << 8) | (buf[5 + dlen + 1] as u16)
+        return Socks5Req { cmd: cmd, atyp: atyp, addr_ipv4: 0, domain: d, port: port, valid: true }
     }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return Socks5Req { cmd: 0, atyp: 0, addr_ipv4: 0, domain: "", port: 0, valid: false }
 }
 
-async fn main() {
-    let conn = Socks5Proxy .new("127.0.0.1", 8080)
-    println("SOCKS5 Proxy ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn reply(rep: u8, bnd_ip: u32, bnd_port: u16) -> [u8] {
+    return [VER, rep, 0x00, ATYP_IPV4,
+            ((bnd_ip >> 24) & 0xFF) as u8, ((bnd_ip >> 16) & 0xFF) as u8,
+            ((bnd_ip >>  8) & 0xFF) as u8,  (bnd_ip        & 0xFF) as u8,
+            ((bnd_port >> 8) & 0xFF) as u8, (bnd_port & 0xFF) as u8]
+}
+
+pub fn main() {
+    let m: u8 = pick_method([0x00, 0x02], [0x00])
+    print("method=", m)
+    print("greeting=", greet_reply(m))
+    let req: [u8] = [0x05, 0x01, 0x00, 0x01, 0x5D, 0xB8, 0xD7, 0x22, 0x00, 0x50]
+    let r: Socks5Req = parse_request(req)
+    print("parsed valid=", r.valid, " ip=0x", r.addr_ipv4, " port=", r.port)
+    print("reply=", reply(REP_OK, 0x0A000001, 54321))
 }
