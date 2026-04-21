@@ -1,39 +1,87 @@
-// WebSocket Client
-module networking.application.websocket_client_net
+// application/websocket_client_net.ltl
+// WebSocket client framing per RFC 6455 sec 5.2.
+//   FIN(1) RSV(3) OPCODE(4) | MASK(1) LEN(7) [ext_len 16 or 64] [mask 32] payload
+// Client->server frames MUST be masked; mask is XOR'd over the payload.
 
-pub struct WebsocketClientNet {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.websocket_client_net
+
+pub const OP_CONT:  u8 = 0x0
+pub const OP_TEXT:  u8 = 0x1
+pub const OP_BIN:   u8 = 0x2
+pub const OP_CLOSE: u8 = 0x8
+pub const OP_PING:  u8 = 0x9
+pub const OP_PONG:  u8 = 0xA
+
+pub fn mask_payload(payload: [u8], key: u32) -> [u8] {
+    let n: u64 = len(payload)
+    let mut out: [u8] = u8_zeros(n)
+    let k: [u8] = [((key >> 24) & 0xFF) as u8, ((key >> 16) & 0xFF) as u8,
+                   ((key >>  8) & 0xFF) as u8,  (key        & 0xFF) as u8]
+    let mut i: u64 = 0
+    while i < n { out[i] = payload[i] ^ k[i % 4]; i = i + 1 }
+    return out
 }
 
-impl WebsocketClientNet {
-    pub fn new(host: str, port: int) -> WebsocketClientNet {
-        return WebsocketClientNet { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn build_frame(opcode: u8, fin: bool, payload: [u8], mask_key: u32) -> [u8] {
+    let plen: u64 = len(payload)
+    let mut hdr: [u8] = []
+    let b0: u8 = if fin { 0x80 | (opcode & 0x0F) } else { (opcode & 0x0F) }
+    hdr.push(b0)
+    let mask_flag: u8 = 0x80
+    if plen < 126 {
+        hdr.push(mask_flag | (plen as u8))
+    } else if plen < 65536 {
+        hdr.push(mask_flag | 126)
+        hdr.push(((plen >> 8) & 0xFF) as u8); hdr.push((plen & 0xFF) as u8)
+    } else {
+        hdr.push(mask_flag | 127)
+        let mut i: i64 = 7
+        while i >= 0 { hdr.push(((plen >> ((i * 8) as u64)) & 0xFF) as u8); i = i - 1 }
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    hdr.push(((mask_key >> 24) & 0xFF) as u8)
+    hdr.push(((mask_key >> 16) & 0xFF) as u8)
+    hdr.push(((mask_key >>  8) & 0xFF) as u8)
+    hdr.push(( mask_key        & 0xFF) as u8)
+    let masked: [u8] = mask_payload(payload, mask_key)
+    let mut out: [u8] = u8_zeros(len(hdr) + plen)
+    let mut i: u64 = 0
+    while i < len(hdr) { out[i] = hdr[i]; i = i + 1 }
+    i = 0
+    while i < plen { out[len(hdr) + i] = masked[i]; i = i + 1 }
+    return out
 }
 
-async fn main() {
-    let conn = WebsocketClientNet .new("127.0.0.1", 8080)
-    println("WebSocket Client ready for host=" + conn.host + " port=" + conn.port as str)
+pub struct Frame { fin: bool, opcode: u8, payload: [u8] }
+
+pub fn parse_frame(buf: [u8]) -> Frame {
+    let b0: u8 = buf[0]; let fin: bool = (b0 & 0x80) != 0
+    let opcode: u8 = b0 & 0x0F
+    let b1: u8 = buf[1]; let masked: bool = (b1 & 0x80) != 0
+    let mut plen: u64 = (b1 & 0x7F) as u64
+    let mut off: u64 = 2
+    if plen == 126 {
+        plen = ((buf[2] as u64) << 8) | (buf[3] as u64); off = 4
+    } else if plen == 127 {
+        plen = 0; let mut i: u64 = 0
+        while i < 8 { plen = (plen << 8) | (buf[2 + i] as u64); i = i + 1 }
+        off = 10
+    }
+    let mut key: u32 = 0
+    if masked {
+        key = ((buf[off] as u32) << 24) | ((buf[off+1] as u32) << 16)
+            | ((buf[off+2] as u32) << 8) | (buf[off+3] as u32)
+        off = off + 4
+    }
+    let mut payload: [u8] = u8_zeros(plen); let mut i: u64 = 0
+    while i < plen { payload[i] = buf[off + i]; i = i + 1 }
+    if masked { payload = mask_payload(payload, key) }
+    return Frame { fin: fin, opcode: opcode, payload: payload }
+}
+
+pub fn main() {
+    let p: [u8] = str_to_bytes("hello")
+    let w: [u8] = build_frame(OP_TEXT, true, p, 0xDEADBEEF)
+    print("frame len=", len(w))
+    let f: Frame = parse_frame(w)
+    print("fin=", f.fin, " op=", f.opcode, " payload=", f.payload)
 }
