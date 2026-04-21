@@ -1,39 +1,53 @@
-// NTP Client
-module networking.application.ntp_client
+// application/ntp_client.ltl
+// NTPv4 client message format and offset/delay computation (RFC 5905 sec 7-8).
+//
+//   delay  = (T4 - T1) - (T3 - T2)
+//   offset = ((T2 - T1) + (T3 - T4)) / 2
+//
+// Timestamps are 64-bit fixed-point: upper 32 bits = seconds since 1900-01-01,
+// lower 32 bits = fractional seconds.
 
-pub struct NtpClient {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.ntp_client
+
+pub const NTP_EPOCH_OFFSET: u64 = 2208988800    // seconds between 1900 and 1970
+
+pub fn unix_to_ntp(unix_secs: u64, frac_us: u64) -> u64 {
+    let secs: u64 = unix_secs + NTP_EPOCH_OFFSET
+    let frac: u64 = (frac_us * 4294967296) / 1000000
+    return (secs << 32) | frac
 }
 
-impl NtpClient {
-    pub fn new(host: str, port: int) -> NtpClient {
-        return NtpClient { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn ntp_to_unix(ntp: u64) -> (u64, u64) {
+    let secs: u64 = (ntp >> 32) - NTP_EPOCH_OFFSET
+    let frac: u64 = ntp & 0xFFFFFFFF
+    let us: u64 = (frac * 1000000) / 4294967296
+    return (secs, us)
 }
 
-async fn main() {
-    let conn = NtpClient .new("127.0.0.1", 8080)
-    println("NTP Client ready for host=" + conn.host + " port=" + conn.port as str)
+// All times as NTP 64-bit fixed-point.
+pub fn compute_offset_delay(t1: u64, t2: u64, t3: u64, t4: u64) -> (i64, i64) {
+    let delay:  i64 = (t4 as i64 - t1 as i64) - (t3 as i64 - t2 as i64)
+    let offset: i64 = ((t2 as i64 - t1 as i64) + (t3 as i64 - t4 as i64)) / 2
+    return (offset, delay)
+}
+
+pub fn build_request(tx_time: u64) -> [u8] {
+    let mut buf: [u8] = u8_zeros(48)
+    buf[0] = 0x23                    // LI=0, VN=4, Mode=3 (client)
+    // transmit timestamp at offset 40.
+    let mut v: u64 = tx_time; let mut i: u64 = 0
+    while i < 8 { buf[40 + (7 - i)] = (v & 0xFF) as u8; v = v >> 8; i = i + 1 }
+    return buf
+}
+
+pub fn main() {
+    // Synthetic four timestamps with a known 50 ms server-client offset.
+    let t1: u64 = unix_to_ntp(1700000000, 0)
+    let t2: u64 = unix_to_ntp(1700000000, 50000)   // server receives, 50 ms later, plus offset model
+    let t3: u64 = unix_to_ntp(1700000000, 60000)
+    let t4: u64 = unix_to_ntp(1700000000, 12000)
+    let (off, del): (i64, i64) = compute_offset_delay(t1, t2, t3, t4)
+    print("offset=", off, " delay=", del)
+    let req: [u8] = build_request(t1)
+    print("req[0]=0x", req[0], " (LI|VN|Mode)")
 }
