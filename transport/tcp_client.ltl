@@ -1,39 +1,88 @@
-// TCP Client
-module networking.transport.tcp_client
+// transport/tcp_client.ltl
+// TCP client state-machine implementation tracking the subset of RFC 9293
+// states a client goes through: CLOSED -> SYN_SENT -> ESTABLISHED ->
+// FIN_WAIT_1 -> FIN_WAIT_2 -> TIME_WAIT -> CLOSED. Sequence/ack numbers
+// are maintained modulo 2^32.
+
+module transport.tcp_client
+
+pub const ST_CLOSED:      u8 = 0
+pub const ST_SYN_SENT:    u8 = 1
+pub const ST_ESTABLISHED: u8 = 2
+pub const ST_FIN_WAIT_1:  u8 = 3
+pub const ST_FIN_WAIT_2:  u8 = 4
+pub const ST_TIME_WAIT:   u8 = 5
 
 pub struct TcpClient {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+    state: u8,
+    snd_iss: u32, snd_nxt: u32, snd_una: u32,
+    rcv_irs: u32, rcv_nxt: u32,
+    remote_ip: u32, remote_port: u16,
+    mss: u16,
 }
 
-impl TcpClient {
-    pub fn new(host: str, port: int) -> TcpClient {
-        return TcpClient { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_client(iss: u32, remote_ip: u32, remote_port: u16) -> TcpClient {
+    return TcpClient { state: ST_CLOSED,
+                       snd_iss: iss, snd_nxt: iss, snd_una: iss,
+                       rcv_irs: 0, rcv_nxt: 0,
+                       remote_ip: remote_ip, remote_port: remote_port,
+                       mss: 1460 }
 }
 
-async fn main() {
-    let conn = TcpClient .new("127.0.0.1", 8080)
-    println("TCP Client ready for host=" + conn.host + " port=" + conn.port as str)
+// Returns the SYN segment to transmit.
+pub fn connect(c: &mut TcpClient) -> u32 {
+    c.state = ST_SYN_SENT
+    c.snd_nxt = c.snd_iss + 1    // consumes one seq for SYN
+    return c.snd_iss              // seq of SYN
+}
+
+// Peer's SYN-ACK: peer_seq = peer ISS, peer_ack = c.snd_iss + 1.
+pub fn on_syn_ack(c: &mut TcpClient, peer_seq: u32, peer_ack: u32) -> bool {
+    if c.state != ST_SYN_SENT { return false }
+    if peer_ack != c.snd_iss + 1 { return false }
+    c.rcv_irs = peer_seq
+    c.rcv_nxt = peer_seq + 1
+    c.snd_una = peer_ack
+    c.state = ST_ESTABLISHED
+    return true
+}
+
+// Send `n` bytes of data; advances snd_nxt. Returns the starting seq #.
+pub fn send(c: &mut TcpClient, n: u32) -> u32 {
+    if c.state != ST_ESTABLISHED { return 0 }
+    let seq: u32 = c.snd_nxt
+    c.snd_nxt = c.snd_nxt + n
+    return seq
+}
+
+pub fn on_ack(c: &mut TcpClient, ack: u32) {
+    if ack > c.snd_una { c.snd_una = ack }
+    if c.state == ST_FIN_WAIT_1 && ack == c.snd_nxt { c.state = ST_FIN_WAIT_2 }
+}
+
+pub fn close(c: &mut TcpClient) -> u32 {
+    let fin_seq: u32 = c.snd_nxt
+    c.snd_nxt = c.snd_nxt + 1
+    c.state = ST_FIN_WAIT_1
+    return fin_seq
+}
+
+pub fn on_peer_fin(c: &mut TcpClient, peer_seq: u32) {
+    if peer_seq != c.rcv_nxt { return }
+    c.rcv_nxt = c.rcv_nxt + 1
+    if c.state == ST_FIN_WAIT_2 { c.state = ST_TIME_WAIT }
+}
+
+pub fn main() {
+    let mut c: TcpClient = new_client(1000, 0x7F000001, 80)
+    let syn_seq: u32 = connect(&mut c)
+    print("SYN seq=", syn_seq, " state=", c.state)
+    on_syn_ack(&mut c, 5000, 1001)
+    print("after SYN-ACK state=", c.state, " rcv_nxt=", c.rcv_nxt)
+    let s: u32 = send(&mut c, 100)
+    print("sent 100 bytes from seq=", s, " snd_nxt=", c.snd_nxt)
+    let f: u32 = close(&mut c)
+    on_ack(&mut c, f + 1)
+    on_peer_fin(&mut c, 5001)
+    print("final state=", c.state, " (expect TIME_WAIT 5)")
 }
