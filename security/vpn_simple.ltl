@@ -1,39 +1,85 @@
-// VPN Tunnel (Simplified)
-module networking.security.vpn_simple
+// security/vpn_simple.ltl
+// Simplified IPsec-ESP-style tunnel framing.
+// Outer header is IPv4 hosting ESP; the inner IP packet is prepended with
+// an SPI (4 bytes), sequence number (4 bytes), and followed by padding, a
+// next-header byte, and a truncated ICV (12 bytes). No real crypto here:
+// "encrypted" payload is XOR'd against a rotating key for demonstration.
+// Ref: RFC 4303.
 
-pub struct VpnSimple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module security.vpn_simple
+
+pub struct Esp { spi: u32, seq: u32, payload: [u8], next_header: u8, icv: [u8] }
+
+fn xor_encrypt(data: [u8], key: [u8]) -> [u8] {
+    let n: u64 = len(data); let m: u64 = len(key)
+    let mut out: [u8] = u8_zeros(n); let mut i: u64 = 0
+    while i < n { out[i] = data[i] ^ key[i % m]; i = i + 1 }
+    return out
 }
 
-impl VpnSimple {
-    pub fn new(host: str, port: int) -> VpnSimple {
-        return VpnSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn encapsulate(spi: u32, seq: u32, inner: [u8], next_hdr: u8, key: [u8]) -> [u8] {
+    // Pad to multiple of 4 bytes (simplification).
+    let mut pad: u64 = 4 - (len(inner) + 2) % 4
+    if pad == 4 { pad = 0 }
+    let total_plain: u64 = len(inner) + pad + 2
+    let mut plain: [u8] = u8_zeros(total_plain)
+    let mut i: u64 = 0
+    while i < len(inner) { plain[i] = inner[i]; i = i + 1 }
+    i = 0
+    while i < pad { plain[len(inner) + i] = (i + 1) as u8; i = i + 1 }
+    plain[total_plain - 2] = pad as u8
+    plain[total_plain - 1] = next_hdr
+    let ct: [u8] = xor_encrypt(plain, key)
+    let icv: [u8] = compute_icv(spi, seq, ct, key)
+    let mut out: [u8] = u8_zeros(8 + len(ct) + len(icv))
+    out[0] = ((spi >> 24) & 0xFF) as u8; out[1] = ((spi >> 16) & 0xFF) as u8
+    out[2] = ((spi >>  8) & 0xFF) as u8; out[3] = ( spi        & 0xFF) as u8
+    out[4] = ((seq >> 24) & 0xFF) as u8; out[5] = ((seq >> 16) & 0xFF) as u8
+    out[6] = ((seq >>  8) & 0xFF) as u8; out[7] = ( seq        & 0xFF) as u8
+    i = 0
+    while i < len(ct)  { out[8 + i]           = ct[i];  i = i + 1 }
+    i = 0
+    while i < len(icv) { out[8 + len(ct) + i] = icv[i]; i = i + 1 }
+    return out
 }
 
-async fn main() {
-    let conn = VpnSimple .new("127.0.0.1", 8080)
-    println("VPN Tunnel (Simplified) ready for host=" + conn.host + " port=" + conn.port as str)
+fn compute_icv(spi: u32, seq: u32, ct: [u8], key: [u8]) -> [u8] {
+    // Toy: first 12 bytes of rolling XOR.
+    let mut h: [u8] = u8_zeros(12)
+    let mut i: u64 = 0
+    while i < len(ct) { h[i % 12] = h[i % 12] ^ ct[i] ^ key[i % len(key)]; i = i + 1 }
+    h[0] = h[0] ^ ((spi >> 24) & 0xFF) as u8; h[1] = h[1] ^ ((spi >> 16) & 0xFF) as u8
+    h[4] = h[4] ^ ((seq >> 24) & 0xFF) as u8; h[5] = h[5] ^ ((seq >> 16) & 0xFF) as u8
+    return h
+}
+
+pub fn decapsulate(buf: [u8], key: [u8]) -> (bool, Esp) {
+    if len(buf) < 8 + 12 + 2 { return (false, Esp { spi: 0, seq: 0, payload: [], next_header: 0, icv: [] }) }
+    let spi: u32 = ((buf[0] as u32) << 24) | ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | (buf[3] as u32)
+    let seq: u32 = ((buf[4] as u32) << 24) | ((buf[5] as u32) << 16) | ((buf[6] as u32) << 8) | (buf[7] as u32)
+    let ct_len: u64 = len(buf) - 8 - 12
+    let mut ct: [u8] = u8_zeros(ct_len); let mut icv: [u8] = u8_zeros(12)
+    let mut i: u64 = 0
+    while i < ct_len { ct[i] = buf[8 + i]; i = i + 1 }
+    i = 0
+    while i < 12 { icv[i] = buf[8 + ct_len + i]; i = i + 1 }
+    let expected: [u8] = compute_icv(spi, seq, ct, key)
+    i = 0
+    while i < 12 { if icv[i] != expected[i] { return (false, Esp { spi: 0, seq: 0, payload: [], next_header: 0, icv: icv }) }; i = i + 1 }
+    let plain: [u8] = xor_encrypt(ct, key)
+    let pad: u8 = plain[len(plain) - 2]
+    let next_hdr: u8 = plain[len(plain) - 1]
+    let inner_len: u64 = len(plain) - 2 - (pad as u64)
+    let mut inner: [u8] = u8_zeros(inner_len); i = 0
+    while i < inner_len { inner[i] = plain[i]; i = i + 1 }
+    return (true, Esp { spi: spi, seq: seq, payload: inner, next_header: next_hdr, icv: icv })
+}
+
+pub fn main() {
+    let key: [u8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]
+    let inner: [u8] = str_to_bytes("inner IPv4 packet payload")
+    let esp: [u8] = encapsulate(0xDEADBEEF, 42, inner, 4, key)
+    let (ok, p): (bool, Esp) = decapsulate(esp, key)
+    print("decap ok=", ok, " spi=0x", p.spi, " seq=", p.seq, " next=", p.next_header)
+    print("recovered=", p.payload)
 }
