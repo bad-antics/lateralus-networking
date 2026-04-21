@@ -1,39 +1,57 @@
-// IP Address Parser
-module networking.utilities.ip_parse
+// utilities/ip_parse.ltl
+// Parse and format IPv4 addresses in dotted-quad notation.
+// IPv4 = A.B.C.D where A,B,C,D in [0,255] -> 32-bit big-endian integer.
+// Ref: RFC 791 (IP), RFC 1123 sec 2.1.
 
-pub struct IpParse {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.ip_parse
+
+// Returns (ok, ip32). ip32 = (A<<24)|(B<<16)|(C<<8)|D.
+pub fn parse_ipv4(s: str) -> (bool, u32) {
+    let n: u64 = len(s)
+    let mut parts: [u64] = [0, 0, 0, 0]
+    let mut pi: u64 = 0
+    let mut cur: u64 = 0
+    let mut has_digit: bool = false
+    let mut i: u64 = 0
+    while i < n {
+        let c: u8 = s[i]
+        if c == '.' {
+            if !has_digit || pi >= 3 { return (false, 0) }
+            parts[pi] = cur; pi = pi + 1; cur = 0; has_digit = false
+        } else if c >= '0' && c <= '9' {
+            cur = cur * 10 + (c - '0') as u64
+            if cur > 255 { return (false, 0) }
+            has_digit = true
+        } else { return (false, 0) }
+        i = i + 1
+    }
+    if !has_digit || pi != 3 { return (false, 0) }
+    parts[3] = cur
+    let ip: u32 = ((parts[0] as u32) << 24) | ((parts[1] as u32) << 16)
+                | ((parts[2] as u32) << 8)  |  (parts[3] as u32)
+    return (true, ip)
 }
 
-impl IpParse {
-    pub fn new(host: str, port: int) -> IpParse {
-        return IpParse { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn format_ipv4(ip: u32) -> str {
+    let a: u32 = (ip >> 24) & 0xFF
+    let b: u32 = (ip >> 16) & 0xFF
+    let c: u32 = (ip >> 8)  & 0xFF
+    let d: u32 =  ip        & 0xFF
+    return itoa(a) + "." + itoa(b) + "." + itoa(c) + "." + itoa(d)
 }
 
-async fn main() {
-    let conn = IpParse .new("127.0.0.1", 8080)
-    println("IP Address Parser ready for host=" + conn.host + " port=" + conn.port as str)
+fn itoa(x: u32) -> str {
+    if x == 0 { return "0" }
+    let mut v: u32 = x; let mut buf: [u8] = u8_zeros(4); let mut n: u64 = 0
+    while v > 0 { buf[n] = ('0' as u8) + ((v % 10) as u8); v = v / 10; n = n + 1 }
+    let mut out: str = ""
+    while n > 0 { n = n - 1; out = out + char_of(buf[n]) }
+    return out
+}
+
+pub fn main() {
+    let (ok, ip): (bool, u32) = parse_ipv4("192.168.1.42")
+    print("ok=", ok, " ip=0x", ip, " round-trip=", format_ipv4(ip))
+    let (ok2, _): (bool, u32) = parse_ipv4("300.1.1.1")
+    print("overflow ok=", ok2, " (expected false)")
 }
