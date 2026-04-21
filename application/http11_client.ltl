@@ -1,39 +1,118 @@
-// HTTP/1.1 Client
-module networking.application.http11_client
+// application/http11_client.ltl
+// Minimal HTTP/1.1 request builder and response parser (RFC 9110/9112).
+// Supports persistent connections (Connection: keep-alive default in 1.1),
+// Content-Length and chunked transfer-encoding decoding.
 
-pub struct Http11Client {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.http11_client
+
+pub struct HttpRequest { method: str, path: str, host: str, headers: [(str, str)], body: [u8] }
+pub struct HttpResponse { status: u16, reason: str, headers: [(str, str)], body: [u8] }
+
+pub fn build_request(req: HttpRequest) -> [u8] {
+    let mut s: str = req.method + " " + req.path + " HTTP/1.1\r\n"
+    s = s + "Host: " + req.host + "\r\n"
+    let mut has_cl: bool = false; let mut has_conn: bool = false
+    let mut i: u64 = 0
+    while i < len(req.headers) {
+        let (k, v): (str, str) = req.headers[i]
+        if lower(k) == "content-length" { has_cl = true }
+        if lower(k) == "connection"     { has_conn = true }
+        s = s + k + ": " + v + "\r\n"; i = i + 1
+    }
+    if !has_cl && len(req.body) > 0 { s = s + "Content-Length: " + itoa(len(req.body)) + "\r\n" }
+    if !has_conn { s = s + "Connection: keep-alive\r\n" }
+    s = s + "\r\n"
+    let hdr_bytes: [u8] = str_to_bytes(s)
+    let total: u64 = len(hdr_bytes) + len(req.body)
+    let mut out: [u8] = u8_zeros(total)
+    let mut k: u64 = 0
+    while k < len(hdr_bytes) { out[k] = hdr_bytes[k]; k = k + 1 }
+    while k < total { out[k] = req.body[k - len(hdr_bytes)]; k = k + 1 }
+    return out
 }
 
-impl Http11Client {
-    pub fn new(host: str, port: int) -> Http11Client {
-        return Http11Client { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+// Parse status line + headers; returns (response, body_start_offset).
+pub fn parse_response(buf: [u8]) -> (HttpResponse, u64) {
+    let mut i: u64 = 0
+    // Status line: HTTP/1.1 SP code SP reason CRLF
+    while i < len(buf) && buf[i] != ' ' as u8 { i = i + 1 }
+    i = i + 1
+    let mut code: u16 = 0
+    while i < len(buf) && buf[i] != ' ' as u8 { code = code * 10 + (buf[i] - '0' as u8) as u16; i = i + 1 }
+    i = i + 1
+    let mut reason: str = ""
+    while i + 1 < len(buf) && !(buf[i] == '\r' as u8 && buf[i+1] == '\n' as u8) {
+        reason = reason + char_of(buf[i]); i = i + 1
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
+    i = i + 2
+    let mut hdrs: [(str, str)] = []
+    while i + 1 < len(buf) {
+        if buf[i] == '\r' as u8 && buf[i+1] == '\n' as u8 { i = i + 2; break }
+        let mut k: str = ""
+        while i < len(buf) && buf[i] != ':' as u8 { k = k + char_of(buf[i]); i = i + 1 }
+        i = i + 1
+        while i < len(buf) && buf[i] == ' ' as u8 { i = i + 1 }
+        let mut v: str = ""
+        while i + 1 < len(buf) && !(buf[i] == '\r' as u8 && buf[i+1] == '\n' as u8) {
+            v = v + char_of(buf[i]); i = i + 1
+        }
+        i = i + 2
+        hdrs.push((k, v))
     }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return (HttpResponse { status: code, reason: reason, headers: hdrs, body: [] }, i)
 }
 
-async fn main() {
-    let conn = Http11Client .new("127.0.0.1", 8080)
-    println("HTTP/1.1 Client ready for host=" + conn.host + " port=" + conn.port as str)
+// Decode chunked transfer-encoding body starting at offset.
+pub fn decode_chunked(buf: [u8], start: u64) -> [u8] {
+    let mut i: u64 = start
+    let mut out: [u8] = []
+    while i < len(buf) {
+        // hex size
+        let mut sz: u64 = 0
+        while i < len(buf) && !(buf[i] == '\r' as u8) {
+            let c: u8 = buf[i]
+            let d: u64 = if c >= '0' as u8 && c <= '9' as u8 { (c - '0' as u8) as u64 }
+                         else if c >= 'a' as u8 && c <= 'f' as u8 { (c - 'a' as u8 + 10) as u64 }
+                         else if c >= 'A' as u8 && c <= 'F' as u8 { (c - 'A' as u8 + 10) as u64 }
+                         else { 0 }
+            sz = sz * 16 + d
+            i = i + 1
+        }
+        i = i + 2   // CRLF
+        if sz == 0 { return out }
+        let mut k: u64 = 0
+        while k < sz { out.push(buf[i + k]); k = k + 1 }
+        i = i + sz + 2
+    }
+    return out
+}
+
+fn lower(s: str) -> str {
+    let mut r: str = ""
+    let mut i: u64 = 0
+    while i < len(s) {
+        let c: u8 = s[i]
+        if c >= 'A' as u8 && c <= 'Z' as u8 { r = r + char_of(c + 32) }
+        else { r = r + char_of(c) }
+        i = i + 1
+    }
+    return r
+}
+fn itoa(x: u64) -> str {
+    if x == 0 { return "0" }
+    let mut v: u64 = x; let mut buf: [u8] = u8_zeros(20); let mut n: u64 = 0
+    while v > 0 { buf[n] = ('0' as u8) + (v % 10) as u8; v = v / 10; n = n + 1 }
+    let mut r: str = ""
+    while n > 0 { n = n - 1; r = r + char_of(buf[n]) }
+    return r
+}
+
+pub fn main() {
+    let req: HttpRequest = HttpRequest { method: "GET", path: "/index.html", host: "example.com",
+                                         headers: [("Accept", "text/html")], body: [] }
+    let wire: [u8] = build_request(req)
+    print("request bytes=", len(wire))
+    let resp_text: str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nHI"
+    let (r, off): (HttpResponse, u64) = parse_response(str_to_bytes(resp_text))
+    print("status=", r.status, " reason=", r.reason, " body_off=", off)
 }
