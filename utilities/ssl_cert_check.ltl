@@ -1,39 +1,71 @@
-// SSL Certificate Checker
-module networking.utilities.ssl_cert_check
+// utilities/ssl_cert_check.ltl
+// TLS/X.509 certificate validator (logic only; no ASN.1 parser here).
+// Checks: notBefore <= now <= notAfter; issuer is in trust list;
+// subject matches hostname (with one wildcard of the form *.domain);
+// key_usage permits digitalSignature / keyEncipherment.
+// Ref: RFC 5280 sec 6.1.
 
-pub struct SslCertCheck {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.ssl_cert_check
+
+pub struct Certificate {
+    subject: str, issuer: str,
+    not_before: u64, not_after: u64,
+    key_usage: u8,                  // bitmask
+    sans: [str],
 }
 
-impl SslCertCheck {
-    pub fn new(host: str, port: int) -> SslCertCheck {
-        return SslCertCheck { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub const KU_DIGITAL_SIG: u8  = 0x80
+pub const KU_KEY_ENCIPHER: u8 = 0x20
+
+pub fn time_valid(c: Certificate, now: u64) -> bool {
+    return now >= c.not_before && now <= c.not_after
 }
 
-async fn main() {
-    let conn = SslCertCheck .new("127.0.0.1", 8080)
-    println("SSL Certificate Checker ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn issuer_trusted(c: Certificate, trust: [str]) -> bool {
+    let mut i: u64 = 0
+    while i < len(trust) { if trust[i] == c.issuer { return true }; i = i + 1 }
+    return false
+}
+
+pub fn name_matches(pattern: str, host: str) -> bool {
+    if pattern == host { return true }
+    // wildcard only as leftmost label: *.domain.com
+    if len(pattern) >= 2 && pattern[0] == '*' && pattern[1] == '.' {
+        let suffix: str = substr(pattern, 2, len(pattern))
+        let hl: u64 = len(host); let sl: u64 = len(suffix)
+        if hl <= sl { return false }
+        let dot_pos: u64 = hl - sl - 1
+        if host[dot_pos] != '.' { return false }
+        return substr(host, hl - sl, hl) == suffix
+    }
+    return false
+}
+
+pub fn host_matches(c: Certificate, host: str) -> bool {
+    if name_matches(c.subject, host) { return true }
+    let mut i: u64 = 0
+    while i < len(c.sans) { if name_matches(c.sans[i], host) { return true }; i = i + 1 }
+    return false
+}
+
+pub fn validate(c: Certificate, host: str, now: u64, trust: [str]) -> (bool, str) {
+    if !time_valid(c, now) { return (false, "expired or not yet valid") }
+    if !issuer_trusted(c, trust) { return (false, "untrusted issuer") }
+    if !host_matches(c, host)    { return (false, "host mismatch") }
+    if (c.key_usage & KU_DIGITAL_SIG) == 0 { return (false, "key_usage digitalSignature missing") }
+    return (true, "ok")
+}
+
+pub fn main() {
+    let c: Certificate = Certificate {
+        subject: "*.example.com", issuer: "R3",
+        not_before: 1000, not_after: 5000,
+        key_usage: 0xA0, sans: ["example.com"]
+    }
+    let (ok, why): (bool, str) = validate(c, "api.example.com", 2000, ["R3", "ISRG Root X1"])
+    print("api.example.com: ok=", ok, " (", why, ")")
+    let (ok2, why2): (bool, str) = validate(c, "other.net", 2000, ["R3"])
+    print("other.net: ok=", ok2, " (", why2, ")")
+    let (ok3, why3): (bool, str) = validate(c, "api.example.com", 9000, ["R3"])
+    print("expired: ok=", ok3, " (", why3, ")")
 }
