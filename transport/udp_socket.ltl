@@ -1,39 +1,61 @@
-// UDP Socket
-module networking.transport.udp_socket
+// transport/udp_socket.ltl
+// User Datagram Protocol header + pseudo-header checksum (RFC 768 / RFC 1071).
+// UDP header: src_port(2) dst_port(2) length(2) checksum(2), then payload.
+// Checksum covers (pseudo-hdr | UDP hdr | payload) with 16-bit one's complement.
 
-pub struct UdpSocket {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module transport.udp_socket
+
+fn add_word(s: u32, w: u32) -> u32 {
+    let mut t: u32 = s + w
+    if t > 0xFFFF { t = (t & 0xFFFF) + 1 }
+    return t
 }
 
-impl UdpSocket {
-    pub fn new(host: str, port: int) -> UdpSocket {
-        return UdpSocket { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn checksum(src_ip: u32, dst_ip: u32, proto: u8, hdr_and_data: [u8]) -> u16 {
+    let length: u32 = len(hdr_and_data) as u32
+    let mut s: u32 = 0
+    s = add_word(s, (src_ip >> 16) & 0xFFFF)
+    s = add_word(s, src_ip & 0xFFFF)
+    s = add_word(s, (dst_ip >> 16) & 0xFFFF)
+    s = add_word(s, dst_ip & 0xFFFF)
+    s = add_word(s, proto as u32)
+    s = add_word(s, length)
+    let mut i: u64 = 0
+    while i + 1 < len(hdr_and_data) {
+        let w: u32 = ((hdr_and_data[i] as u32) << 8) | (hdr_and_data[i + 1] as u32)
+        s = add_word(s, w); i = i + 2
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
+    if i < len(hdr_and_data) {
+        s = add_word(s, (hdr_and_data[i] as u32) << 8)
     }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    let c: u16 = (~s) as u16 & 0xFFFF
+    if c == 0 { return 0xFFFF }    // RFC 768: computed zero must be 0xFFFF
+    return c
 }
 
-async fn main() {
-    let conn = UdpSocket .new("127.0.0.1", 8080)
-    println("UDP Socket ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn build(src_ip: u32, dst_ip: u32, sp: u16, dp: u16, payload: [u8]) -> [u8] {
+    let plen: u64 = len(payload)
+    let total: u64 = 8 + plen
+    let mut buf: [u8] = u8_zeros(total)
+    buf[0] = ((sp >> 8) & 0xFF) as u8; buf[1] = (sp & 0xFF) as u8
+    buf[2] = ((dp >> 8) & 0xFF) as u8; buf[3] = (dp & 0xFF) as u8
+    buf[4] = ((total >> 8) & 0xFF) as u8; buf[5] = (total & 0xFF) as u8
+    buf[6] = 0; buf[7] = 0
+    let mut i: u64 = 0
+    while i < plen { buf[8 + i] = payload[i]; i = i + 1 }
+    let c: u16 = checksum(src_ip, dst_ip, 17, buf)
+    buf[6] = ((c >> 8) & 0xFF) as u8; buf[7] = (c & 0xFF) as u8
+    return buf
+}
+
+pub fn verify(src_ip: u32, dst_ip: u32, pkt: [u8]) -> bool {
+    return checksum(src_ip, dst_ip, 17, pkt) == 0 ||
+           (((pkt[6] as u16) << 8) | (pkt[7] as u16)) == 0
+}
+
+pub fn main() {
+    let payload: [u8] = [0xDE, 0xAD, 0xBE, 0xEF]
+    let pkt: [u8] = build(0xC0A80001, 0xC0A80002, 12345, 53, payload)
+    print("len=", len(pkt), " csum=0x", ((pkt[6] as u16) << 8) | (pkt[7] as u16))
+    print("verify=", verify(0xC0A80001, 0xC0A80002, pkt))
 }
