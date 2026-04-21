@@ -1,39 +1,48 @@
-// CIDR Calculator
-module networking.utilities.cidr_calc
+// utilities/cidr_calc.ltl
+// CIDR arithmetic for IPv4.
+// prefix /P -> netmask = (0xFFFFFFFF << (32-P)) when P>0 else 0.
+// network = ip & mask; broadcast = network | ~mask; host_count = 2^(32-P) - 2 (for P<=30).
+// Ref: RFC 4632.
 
-pub struct CidrCalc {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.cidr_calc
+
+pub fn netmask(prefix: u32) -> u32 {
+    if prefix == 0 { return 0 }
+    if prefix >= 32 { return 0xFFFFFFFF }
+    return 0xFFFFFFFF << (32 - prefix)
 }
 
-impl CidrCalc {
-    pub fn new(host: str, port: int) -> CidrCalc {
-        return CidrCalc { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn network_addr(ip: u32, prefix: u32) -> u32 { return ip & netmask(prefix) }
+pub fn broadcast_addr(ip: u32, prefix: u32) -> u32 {
+    let m: u32 = netmask(prefix)
+    return (ip & m) | (~m)
+}
+pub fn host_count(prefix: u32) -> u64 {
+    if prefix >= 32 { return 1 }
+    if prefix == 31 { return 2 }    // RFC 3021 p2p
+    let hosts: u64 = 1 << (32 - prefix)
+    return hosts - 2
 }
 
-async fn main() {
-    let conn = CidrCalc .new("127.0.0.1", 8080)
-    println("CIDR Calculator ready for host=" + conn.host + " port=" + conn.port as str)
+// Check whether ip is within network/prefix.
+pub fn contains(network: u32, prefix: u32, ip: u32) -> bool {
+    let m: u32 = netmask(prefix)
+    return (ip & m) == (network & m)
+}
+
+// Return (network, first_host, last_host, broadcast).
+pub fn subnet_range(ip: u32, prefix: u32) -> (u32, u32, u32, u32) {
+    let net: u32 = network_addr(ip, prefix)
+    let bc:  u32 = broadcast_addr(ip, prefix)
+    if prefix >= 31 { return (net, net, bc, bc) }
+    return (net, net + 1, bc - 1, bc)
+}
+
+pub fn main() {
+    // 192.168.1.42 / 24 -> network 192.168.1.0, broadcast 192.168.1.255.
+    let ip: u32 = 0xC0A8012A
+    print("mask /24=0x", netmask(24))
+    print("net=0x",     network_addr(ip, 24), " bcast=0x", broadcast_addr(ip, 24))
+    print("hosts/24=",  host_count(24))
+    print("contains 192.168.1.10?", contains(network_addr(ip,24), 24, 0xC0A8010A))
 }
