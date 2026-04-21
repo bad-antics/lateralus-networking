@@ -1,39 +1,75 @@
-// RIP Protocol
-module networking.protocols.rip_simple
+// protocols/rip_simple.ltl
+// RIPv2 distance-vector routing (RFC 2453). Nodes advertise their vectors
+// every update_period; receivers apply the Bellman-Ford relaxation with
+// infinity = 16 hops, and honour split-horizon w/ poisoned reverse.
 
-pub struct RipSimple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module protocols.rip_simple
+
+pub const INF: u32 = 16
+
+pub struct Route { dest: u32, next_hop: u32, metric: u32, via_iface: u32 }
+pub struct RipNode { id: u32, routes: [Route] }
+
+pub fn find(n: RipNode, dest: u32) -> i64 {
+    let mut i: u64 = 0
+    while i < len(n.routes) { if n.routes[i].dest == dest { return i as i64 }; i = i + 1 }
+    return -1
 }
 
-impl RipSimple {
-    pub fn new(host: str, port: int) -> RipSimple {
-        return RipSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+// Receive advertised vector from neighbour `from` over `iface` with cost 1.
+pub fn receive(n: &mut RipNode, from_id: u32, iface: u32, vector: [Route]) -> bool {
+    let mut changed: bool = false
+    let mut i: u64 = 0
+    while i < len(vector) {
+        let r: Route = vector[i]
+        let new_metric: u32 = if r.metric >= INF { INF } else { r.metric + 1 }
+        let idx: i64 = find(*n, r.dest)
+        if idx < 0 {
+            if new_metric < INF {
+                n.routes.push(Route { dest: r.dest, next_hop: from_id, metric: new_metric, via_iface: iface })
+                changed = true
+            }
+        } else {
+            let cur: Route = n.routes[idx as u64]
+            if cur.next_hop == from_id {
+                if cur.metric != new_metric {
+                    n.routes[idx as u64].metric = new_metric
+                    changed = true
+                }
+            } else if new_metric < cur.metric {
+                n.routes[idx as u64].metric = new_metric
+                n.routes[idx as u64].next_hop = from_id
+                n.routes[idx as u64].via_iface = iface
+                changed = true
+            }
+        }
+        i = i + 1
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return changed
 }
 
-async fn main() {
-    let conn = RipSimple .new("127.0.0.1", 8080)
-    println("RIP Protocol ready for host=" + conn.host + " port=" + conn.port as str)
+// Build an advertisement for interface `iface` with split-horizon/poisoned-reverse.
+pub fn advertise(n: RipNode, iface: u32) -> [Route] {
+    let mut out: [Route] = []
+    let mut i: u64 = 0
+    while i < len(n.routes) {
+        let r: Route = n.routes[i]
+        if r.via_iface == iface {
+            out.push(Route { dest: r.dest, next_hop: 0, metric: INF, via_iface: 0 })  // poisoned
+        } else {
+            out.push(Route { dest: r.dest, next_hop: 0, metric: r.metric, via_iface: 0 })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn main() {
+    let mut a: RipNode = RipNode { id: 1, routes: [] }
+    // Neighbour 2 advertises it can reach dest 99 in 3 hops.
+    let v: [Route] = [Route { dest: 99, next_hop: 0, metric: 3, via_iface: 0 }]
+    let ch: bool = receive(&mut a, 2, 10, v)
+    print("changed=", ch, " route[0]=", a.routes[0].dest, "via", a.routes[0].next_hop, "cost", a.routes[0].metric)
+    let adv: [Route] = advertise(a, 10)
+    print("poisoned reverse out iface 10: dest=", adv[0].dest, " metric=", adv[0].metric, " (expected 16)")
 }
