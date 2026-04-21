@@ -1,39 +1,82 @@
-// ARP Table
-module networking.protocols.arp_table
+// protocols/arp_table.ltl
+// IPv4 Address Resolution Protocol cache (RFC 826).
+// State machine: INCOMPLETE -> REACHABLE -> STALE -> DELAY -> PROBE -> FAILED
+// (simplified from RFC 4861/7039). Entries time out after reachable_ttl.
 
-pub struct ArpTable {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module protocols.arp_table
+
+pub const ST_INCOMPLETE: u8 = 0
+pub const ST_REACHABLE:  u8 = 1
+pub const ST_STALE:      u8 = 2
+pub const ST_FAILED:     u8 = 3
+
+pub struct ArpEntry {
+    ip: u32, mac: [u8], state: u8,
+    expires_at: u64, retries: u8, used: bool,
 }
 
-impl ArpTable {
-    pub fn new(host: str, port: int) -> ArpTable {
-        return ArpTable { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub struct ArpTable { cap: u64, clock: u64, reachable_ttl: u64, entries: [ArpEntry] }
+
+pub fn new_table(cap: u64, ttl: u64) -> ArpTable {
+    return ArpTable { cap: cap, clock: 0, reachable_ttl: ttl, entries: [] }
 }
 
-async fn main() {
-    let conn = ArpTable .new("127.0.0.1", 8080)
-    println("ARP Table ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn tick(t: &mut ArpTable) {
+    t.clock = t.clock + 1
+    let mut i: u64 = 0
+    while i < len(t.entries) {
+        if t.entries[i].state == ST_REACHABLE && t.entries[i].expires_at <= t.clock {
+            t.entries[i].state = ST_STALE
+        }
+        i = i + 1
+    }
+}
+
+fn find(t: ArpTable, ip: u32) -> i64 {
+    let mut i: u64 = 0
+    while i < len(t.entries) { if t.entries[i].used && t.entries[i].ip == ip { return i as i64 }; i = i + 1 }
+    return -1
+}
+
+pub fn on_reply(t: &mut ArpTable, ip: u32, mac: [u8]) {
+    let idx: i64 = find(*t, ip)
+    if idx >= 0 {
+        t.entries[idx as u64].mac = mac
+        t.entries[idx as u64].state = ST_REACHABLE
+        t.entries[idx as u64].expires_at = t.clock + t.reachable_ttl
+        t.entries[idx as u64].retries = 0
+        return
+    }
+    if len(t.entries) >= t.cap { t.entries.remove(0) }
+    t.entries.push(ArpEntry { ip: ip, mac: mac, state: ST_REACHABLE,
+                              expires_at: t.clock + t.reachable_ttl, retries: 0, used: true })
+}
+
+pub fn request_needed(t: &mut ArpTable, ip: u32) -> bool {
+    let idx: i64 = find(*t, ip)
+    if idx < 0 {
+        if len(t.entries) >= t.cap { t.entries.remove(0) }
+        t.entries.push(ArpEntry { ip: ip, mac: u8_zeros(6), state: ST_INCOMPLETE,
+                                  expires_at: t.clock + 3, retries: 0, used: true })
+        return true
+    }
+    let e: ArpEntry = t.entries[idx as u64]
+    return e.state == ST_INCOMPLETE || e.state == ST_STALE
+}
+
+pub fn lookup(t: ArpTable, ip: u32) -> (bool, [u8]) {
+    let idx: i64 = find(t, ip)
+    if idx < 0 { return (false, u8_zeros(6)) }
+    let e: ArpEntry = t.entries[idx as u64]
+    if e.state == ST_REACHABLE || e.state == ST_STALE { return (true, e.mac) }
+    return (false, u8_zeros(6))
+}
+
+pub fn main() {
+    let mut t: ArpTable = new_table(32, 60)
+    let need: bool = request_needed(&mut t, 0x0A000001)
+    print("need request? ", need)
+    on_reply(&mut t, 0x0A000001, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+    let (ok, mac): (bool, [u8]) = lookup(t, 0x0A000001)
+    print("resolved ok=", ok, " mac=", mac)
 }
