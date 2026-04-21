@@ -1,39 +1,73 @@
-// TCP Server
-module networking.transport.tcp_server
+// transport/tcp_server.ltl
+// TCP server (passive open) state-machine.
+// CLOSED -> LISTEN -> SYN_RCVD -> ESTABLISHED -> CLOSE_WAIT -> LAST_ACK -> CLOSED.
+// Ref: RFC 9293 fig 5.
+
+module transport.tcp_server
+
+pub const ST_CLOSED:      u8 = 0
+pub const ST_LISTEN:      u8 = 1
+pub const ST_SYN_RCVD:    u8 = 2
+pub const ST_ESTABLISHED: u8 = 3
+pub const ST_CLOSE_WAIT:  u8 = 4
+pub const ST_LAST_ACK:    u8 = 5
 
 pub struct TcpServer {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+    state: u8,
+    iss: u32, snd_nxt: u32, snd_una: u32,
+    rcv_irs: u32, rcv_nxt: u32,
 }
 
-impl TcpServer {
-    pub fn new(host: str, port: int) -> TcpServer {
-        return TcpServer { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn listen(iss: u32) -> TcpServer {
+    return TcpServer { state: ST_LISTEN, iss: iss, snd_nxt: iss, snd_una: iss,
+                       rcv_irs: 0, rcv_nxt: 0 }
 }
 
-async fn main() {
-    let conn = TcpServer .new("127.0.0.1", 8080)
-    println("TCP Server ready for host=" + conn.host + " port=" + conn.port as str)
+// On receive of client SYN with seq=S; return (our seq, our ack) for SYN-ACK.
+pub fn on_syn(s: &mut TcpServer, client_seq: u32) -> (u32, u32) {
+    if s.state != ST_LISTEN { return (0, 0) }
+    s.rcv_irs = client_seq
+    s.rcv_nxt = client_seq + 1
+    s.snd_nxt = s.iss + 1
+    s.state = ST_SYN_RCVD
+    return (s.iss, s.rcv_nxt)
+}
+
+pub fn on_ack_of_syn(s: &mut TcpServer, ack: u32) -> bool {
+    if s.state != ST_SYN_RCVD { return false }
+    if ack != s.iss + 1 { return false }
+    s.snd_una = ack
+    s.state = ST_ESTABLISHED
+    return true
+}
+
+pub fn on_peer_fin(s: &mut TcpServer, peer_seq: u32) {
+    if peer_seq != s.rcv_nxt { return }
+    s.rcv_nxt = s.rcv_nxt + 1
+    if s.state == ST_ESTABLISHED { s.state = ST_CLOSE_WAIT }
+}
+
+// Application closes our side.
+pub fn close(s: &mut TcpServer) -> u32 {
+    let fin_seq: u32 = s.snd_nxt
+    s.snd_nxt = s.snd_nxt + 1
+    if s.state == ST_CLOSE_WAIT { s.state = ST_LAST_ACK }
+    return fin_seq
+}
+
+pub fn on_final_ack(s: &mut TcpServer, ack: u32) {
+    if s.state == ST_LAST_ACK && ack == s.snd_nxt { s.state = ST_CLOSED }
+}
+
+pub fn main() {
+    let mut s: TcpServer = listen(9000)
+    let (sv_seq, sv_ack): (u32, u32) = on_syn(&mut s, 4000)
+    print("SYN-ACK seq=", sv_seq, " ack=", sv_ack, " state=", s.state)
+    on_ack_of_syn(&mut s, 9001)
+    print("state=", s.state, " (expect ESTABLISHED 3)")
+    on_peer_fin(&mut s, 4001)
+    print("state=", s.state, " (expect CLOSE_WAIT 4)")
+    let f: u32 = close(&mut s)
+    on_final_ack(&mut s, f + 1)
+    print("final state=", s.state, " (expect CLOSED 0)")
 }
