@@ -1,39 +1,57 @@
-// SNMP (Simplified)
-module networking.protocols.snmp_simple
+// protocols/snmp_simple.ltl
+// SNMPv2c GetRequest / GetResponse walking a MIB modelled as a trie of
+// ordered OIDs. GetNext returns the lexicographically next OID >= query.
+// Refs: RFC 3416 (SNMPv2 ops), RFC 1157 (SNMPv1).
 
-pub struct SnmpSimple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module protocols.snmp_simple
+
+pub struct MibVar { oid: [u32], value: i64 }
+
+pub fn cmp_oid(a: [u32], b: [u32]) -> i32 {
+    let la: u64 = len(a); let lb: u64 = len(b)
+    let m: u64 = if la < lb { la } else { lb }
+    let mut i: u64 = 0
+    while i < m {
+        if a[i] < b[i] { return -1 }
+        if a[i] > b[i] { return  1 }
+        i = i + 1
+    }
+    if la < lb { return -1 }
+    if la > lb { return  1 }
+    return 0
 }
 
-impl SnmpSimple {
-    pub fn new(host: str, port: int) -> SnmpSimple {
-        return SnmpSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn get(mib: [MibVar], oid: [u32]) -> (bool, i64) {
+    let mut i: u64 = 0
+    while i < len(mib) {
+        if cmp_oid(mib[i].oid, oid) == 0 { return (true, mib[i].value) }
+        i = i + 1
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return (false, 0)
 }
 
-async fn main() {
-    let conn = SnmpSimple .new("127.0.0.1", 8080)
-    println("SNMP (Simplified) ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn get_next(mib: [MibVar], oid: [u32]) -> (bool, [u32], i64) {
+    let mut best: i64 = -1
+    let mut i: u64 = 0
+    while i < len(mib) {
+        if cmp_oid(mib[i].oid, oid) > 0 {
+            if best < 0 || cmp_oid(mib[i].oid, mib[best as u64].oid) < 0 { best = i as i64 }
+        }
+        i = i + 1
+    }
+    if best < 0 { return (false, [], 0) }
+    let v: MibVar = mib[best as u64]
+    return (true, v.oid, v.value)
+}
+
+pub fn main() {
+    let mib: [MibVar] = [
+        MibVar { oid: [1, 3, 6, 1, 2, 1, 1, 1], value: 42 },   // sysDescr-ish
+        MibVar { oid: [1, 3, 6, 1, 2, 1, 1, 3], value: 1000 }, // sysUpTime-ish
+        MibVar { oid: [1, 3, 6, 1, 2, 1, 2, 1], value: 7 }
+    ]
+    let (ok, v): (bool, i64) = get(mib, [1, 3, 6, 1, 2, 1, 1, 3])
+    print("get: ok=", ok, " value=", v)
+    let (ok2, oid, v2): (bool, [u32], i64) = get_next(mib, [1, 3, 6, 1, 2, 1, 1, 1])
+    print("getnext: ok=", ok2, " oid=", oid, " value=", v2)
 }
