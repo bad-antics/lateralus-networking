@@ -1,39 +1,73 @@
-// SMTP Client
-module networking.application.smtp_client
+// application/smtp_client.ltl
+// SMTP client per RFC 5321. Command sequence:
+//   EHLO -> MAIL FROM -> RCPT TO (one or more) -> DATA -> <body> + "." -> QUIT.
+// Returns false on any non-2xx / non-3xx reply where not allowed.
 
-pub struct SmtpClient {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.smtp_client
+
+pub const ST_INIT:   u8 = 0
+pub const ST_HELO:   u8 = 1
+pub const ST_MAIL:   u8 = 2
+pub const ST_RCPT:   u8 = 3
+pub const ST_DATA:   u8 = 4
+pub const ST_BODY:   u8 = 5
+pub const ST_DONE:   u8 = 6
+
+pub struct SmtpClient { state: u8, rcpts: [str] }
+
+pub fn new_client() -> SmtpClient { return SmtpClient { state: ST_INIT, rcpts: [] } }
+
+pub fn on_greeting(c: &mut SmtpClient, code: u16) -> bool { if code == 220 { c.state = ST_HELO; return true }; return false }
+
+pub fn send_ehlo(c: &mut SmtpClient, reply: u16) -> bool {
+    if c.state != ST_HELO { return false }
+    if reply == 250 { c.state = ST_MAIL; return true }
+    return false
 }
 
-impl SmtpClient {
-    pub fn new(host: str, port: int) -> SmtpClient {
-        return SmtpClient { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn send_mail_from(c: &mut SmtpClient, reply: u16) -> bool {
+    if c.state != ST_MAIL { return false }
+    if reply == 250 { c.state = ST_RCPT; return true }
+    return false
 }
 
-async fn main() {
-    let conn = SmtpClient .new("127.0.0.1", 8080)
-    println("SMTP Client ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn send_rcpt(c: &mut SmtpClient, addr: str, reply: u16) -> bool {
+    if c.state != ST_RCPT { return false }
+    if reply == 250 || reply == 251 { c.rcpts.push(addr); return true }
+    return false
+}
+
+pub fn send_data(c: &mut SmtpClient, reply: u16) -> bool {
+    if c.state != ST_RCPT || len(c.rcpts) == 0 { return false }
+    if reply == 354 { c.state = ST_BODY; return true }
+    return false
+}
+
+pub fn send_body(c: &mut SmtpClient, reply: u16) -> bool {
+    if c.state != ST_BODY { return false }
+    if reply == 250 { c.state = ST_DONE; return true }
+    return false
+}
+
+// CR LF "." CR LF terminator check.
+pub fn body_terminator_ok(body: [u8]) -> bool {
+    let n: u64 = len(body)
+    if n < 5 { return false }
+    return body[n-5] == '\r' as u8 && body[n-4] == '\n' as u8 &&
+           body[n-3] == '.'  as u8 &&
+           body[n-2] == '\r' as u8 && body[n-1] == '\n' as u8
+}
+
+pub fn main() {
+    let mut c: SmtpClient = new_client()
+    on_greeting(&mut c, 220)
+    send_ehlo(&mut c, 250)
+    send_mail_from(&mut c, 250)
+    send_rcpt(&mut c, "alice@example.com", 250)
+    send_rcpt(&mut c, "bob@example.com", 250)
+    send_data(&mut c, 354)
+    send_body(&mut c, 250)
+    print("state=", c.state, " rcpts=", len(c.rcpts), " (expect DONE 6, 2)")
+    let body: [u8] = str_to_bytes("Subject: hi\r\n\r\nhello\r\n.\r\n")
+    print("body terminator ok? ", body_terminator_ok(body))
 }
