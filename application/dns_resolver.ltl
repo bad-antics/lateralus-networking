@@ -1,39 +1,105 @@
-// DNS Resolver
-module networking.application.dns_resolver
+// application/dns_resolver.ltl
+// DNS message encoder/decoder (RFC 1035 sec 4.1). Supports the question
+// section and A-record answers; handles compressed name pointers (0xC0).
 
-pub struct DnsResolver {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.dns_resolver
+
+pub struct DnsHdr { id: u16, flags: u16, qdcount: u16, ancount: u16, nscount: u16, arcount: u16 }
+
+pub fn encode_query(id: u16, qname: str, qtype: u16) -> [u8] {
+    let labels: [u8] = encode_name(qname)
+    let total: u64 = 12 + len(labels) + 4
+    let mut buf: [u8] = u8_zeros(total)
+    write_u16(buf, 0, id)
+    write_u16(buf, 2, 0x0100)      // RD flag
+    write_u16(buf, 4, 1); write_u16(buf, 6, 0); write_u16(buf, 8, 0); write_u16(buf, 10, 0)
+    let mut i: u64 = 0
+    while i < len(labels) { buf[12 + i] = labels[i]; i = i + 1 }
+    write_u16(buf, 12 + len(labels),     qtype)
+    write_u16(buf, 12 + len(labels) + 2, 1)       // class IN
+    return buf
 }
 
-impl DnsResolver {
-    pub fn new(host: str, port: int) -> DnsResolver {
-        return DnsResolver { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+fn encode_name(s: str) -> [u8] {
+    let mut out: [u8] = []
+    let mut label: [u8] = []
+    let mut i: u64 = 0
+    while i < len(s) {
+        let c: u8 = s[i]
+        if c == '.' as u8 {
+            out.push(len(label) as u8)
+            let mut j: u64 = 0
+            while j < len(label) { out.push(label[j]); j = j + 1 }
+            label = []
+        } else { label.push(c) }
+        i = i + 1
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
+    if len(label) > 0 {
+        out.push(len(label) as u8)
+        let mut j: u64 = 0
+        while j < len(label) { out.push(label[j]); j = j + 1 }
     }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    out.push(0)
+    return out
 }
 
-async fn main() {
-    let conn = DnsResolver .new("127.0.0.1", 8080)
-    println("DNS Resolver ready for host=" + conn.host + " port=" + conn.port as str)
+fn write_u16(buf: [u8], off: u64, v: u16) {
+    buf[off] = ((v >> 8) & 0xFF) as u8; buf[off + 1] = (v & 0xFF) as u8
+}
+fn read_u16(buf: [u8], off: u64) -> u16 { return ((buf[off] as u16) << 8) | (buf[off + 1] as u16) }
+fn read_u32(buf: [u8], off: u64) -> u32 {
+    return ((buf[off] as u32) << 24) | ((buf[off+1] as u32) << 16)
+         | ((buf[off+2] as u32) << 8) | (buf[off+3] as u32)
+}
+
+// Decode a name at offset; returns (name, next_offset_after_name).
+pub fn decode_name(buf: [u8], off: u64) -> (str, u64) {
+    let mut s: str = ""
+    let mut i: u64 = off
+    let mut jumped: bool = false
+    let mut orig_end: u64 = off
+    while i < len(buf) && buf[i] != 0 {
+        let b: u8 = buf[i]
+        if (b & 0xC0) == 0xC0 {
+            let ptr: u16 = (((b & 0x3F) as u16) << 8) | (buf[i + 1] as u16)
+            if !jumped { orig_end = i + 2; jumped = true }
+            i = ptr as u64
+            continue
+        }
+        let llen: u64 = b as u64
+        i = i + 1
+        if len(s) > 0 { s = s + "." }
+        let mut k: u64 = 0
+        while k < llen { s = s + char_of(buf[i + k]); k = k + 1 }
+        i = i + llen
+    }
+    if !jumped { orig_end = i + 1 }
+    return (s, orig_end)
+}
+
+pub fn parse_first_a(buf: [u8]) -> (bool, u32) {
+    let qd: u16 = read_u16(buf, 4); let an: u16 = read_u16(buf, 6)
+    if an == 0 { return (false, 0) }
+    let mut off: u64 = 12
+    let mut q: u16 = 0
+    while q < qd { let (_n, nxt): (str, u64) = decode_name(buf, off); off = nxt + 4; q = q + 1 }
+    let mut a: u16 = 0
+    while a < an {
+        let (_n, nxt): (str, u64) = decode_name(buf, off); off = nxt
+        let atype: u16 = read_u16(buf, off)
+        let rdlen: u16 = read_u16(buf, off + 8)
+        if atype == 1 && rdlen == 4 {
+            return (true, read_u32(buf, off + 10))
+        }
+        off = off + 10 + (rdlen as u64)
+        a = a + 1
+    }
+    return (false, 0)
+}
+
+pub fn main() {
+    let q: [u8] = encode_query(0x1234, "example.com", 1)
+    print("query len=", len(q))
+    let (n, off): (str, u64) = decode_name(q, 12)
+    print("decoded qname=", n, " next_off=", off)
 }
