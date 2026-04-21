@@ -1,39 +1,67 @@
-// DHCP Client
-module networking.protocols.dhcp_client
+// protocols/dhcp_client.ltl
+// DHCPv4 client state machine (RFC 2131 sec 4.4).
+//
+//   INIT -> DISCOVER -> SELECTING -> REQUEST -> BOUND
+//                 (OFFER)              (ACK)
+//   BOUND -> RENEWING (T1 = 0.5*lease) -> REBINDING (T2 = 0.875*lease)
+//
+// On NAK or expiry, returns to INIT.
+
+module protocols.dhcp_client
+
+pub const ST_INIT:      u8 = 0
+pub const ST_SELECTING: u8 = 1
+pub const ST_REQUESTING:u8 = 2
+pub const ST_BOUND:     u8 = 3
+pub const ST_RENEWING:  u8 = 4
+pub const ST_REBINDING: u8 = 5
 
 pub struct DhcpClient {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+    state: u8,
+    xid: u32, lease_secs: u32, t1: u32, t2: u32,
+    offered_ip: u32, server_ip: u32,
+    bound_at: u64, now: u64,
 }
 
-impl DhcpClient {
-    pub fn new(host: str, port: int) -> DhcpClient {
-        return DhcpClient { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_client(xid: u32) -> DhcpClient {
+    return DhcpClient { state: ST_INIT, xid: xid, lease_secs: 0, t1: 0, t2: 0,
+                        offered_ip: 0, server_ip: 0, bound_at: 0, now: 0 }
 }
 
-async fn main() {
-    let conn = DhcpClient .new("127.0.0.1", 8080)
-    println("DHCP Client ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn start(c: &mut DhcpClient) { c.state = ST_SELECTING }
+
+pub fn on_offer(c: &mut DhcpClient, offered_ip: u32, server_ip: u32) {
+    if c.state != ST_SELECTING { return }
+    c.offered_ip = offered_ip; c.server_ip = server_ip
+    c.state = ST_REQUESTING
+}
+
+pub fn on_ack(c: &mut DhcpClient, lease_secs: u32, now: u64) {
+    if c.state != ST_REQUESTING && c.state != ST_RENEWING && c.state != ST_REBINDING { return }
+    c.lease_secs = lease_secs
+    c.t1 = lease_secs / 2
+    c.t2 = (lease_secs * 7) / 8
+    c.state = ST_BOUND
+    c.bound_at = now; c.now = now
+}
+
+pub fn on_nak(c: &mut DhcpClient) { c.state = ST_INIT }
+
+pub fn tick_to(c: &mut DhcpClient, now: u64) {
+    c.now = now
+    if c.state != ST_BOUND && c.state != ST_RENEWING { return }
+    let elapsed: u64 = now - c.bound_at
+    if elapsed >= (c.lease_secs as u64) { c.state = ST_INIT; return }
+    if elapsed >= (c.t2 as u64) { c.state = ST_REBINDING; return }
+    if elapsed >= (c.t1 as u64) { c.state = ST_RENEWING; return }
+}
+
+pub fn main() {
+    let mut c: DhcpClient = new_client(0xDEADBEEF)
+    start(&mut c); on_offer(&mut c, 0x0A00010F, 0x0A000001)
+    on_ack(&mut c, 1000, 0)
+    print("state=", c.state, " ip=0x", c.offered_ip, " t1=", c.t1, " t2=", c.t2)
+    tick_to(&mut c, 500); print("at 500 state=", c.state, " (expect RENEWING 4)")
+    tick_to(&mut c, 900); print("at 900 state=", c.state, " (expect REBINDING 5)")
+    tick_to(&mut c, 1100); print("at 1100 state=", c.state, " (expect INIT 0)")
 }
