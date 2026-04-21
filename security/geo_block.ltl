@@ -1,39 +1,42 @@
-// Geo-IP Blocking
-module networking.security.geo_block
+// security/geo_block.ltl
+// IP-to-country geo-blocking using sorted CIDR ranges; binary-search lookup
+// gives O(log n). Country codes in a compact allow/deny list.
+// Data feeds typically come from MaxMind GeoLite or Team Cymru BGP mappings.
 
-pub struct GeoBlock {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module security.geo_block
+
+pub struct Range { start: u32, end: u32, country: str }
+
+// Binary search: returns country code or "??" if not found.
+pub fn lookup(ranges: [Range], ip: u32) -> str {
+    let n: u64 = len(ranges)
+    if n == 0 { return "??" }
+    let mut lo: i64 = 0; let mut hi: i64 = (n - 1) as i64
+    while lo <= hi {
+        let mid: i64 = (lo + hi) / 2
+        let r: Range = ranges[mid as u64]
+        if ip < r.start { hi = mid - 1 }
+        else if ip > r.end { lo = mid + 1 }
+        else { return r.country }
+    }
+    return "??"
 }
 
-impl GeoBlock {
-    pub fn new(host: str, port: int) -> GeoBlock {
-        return GeoBlock { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn is_blocked(ranges: [Range], ip: u32, deny: [str]) -> bool {
+    let cc: str = lookup(ranges, ip)
+    let mut i: u64 = 0
+    while i < len(deny) { if deny[i] == cc { return true }; i = i + 1 }
+    return false
 }
 
-async fn main() {
-    let conn = GeoBlock .new("127.0.0.1", 8080)
-    println("Geo-IP Blocking ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn main() {
+    let db: [Range] = [
+        Range { start: 0x01000000, end: 0x01FFFFFF, country: "AU" },
+        Range { start: 0x08000000, end: 0x08FFFFFF, country: "US" },
+        Range { start: 0xC0A80000, end: 0xC0A8FFFF, country: "XX" },
+    ]
+    print("cc 1.2.3.4 -> ",    lookup(db, 0x01020304))
+    print("cc 8.8.8.8 -> ",    lookup(db, 0x08080808))
+    print("cc 192.168.1.1 -> ",lookup(db, 0xC0A80101))
+    print("block AU?",         is_blocked(db, 0x01020304, ["AU", "KP"]))
 }
