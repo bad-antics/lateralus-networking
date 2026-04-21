@@ -1,39 +1,45 @@
-// Bandwidth Throttler
-module networking.utilities.bandwidth_throttle
+// utilities/bandwidth_throttle.ltl
+// Token-bucket rate limiter for outbound bytes. Tokens refill at rate_bps
+// per second up to burst_bytes. A write of n bytes consumes n tokens; if
+// insufficient, returns the wait time in microseconds.
+// Refs: Turner 1986; RFC 2697 (srTCM).
 
-pub struct BandwidthThrottle {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.bandwidth_throttle
+
+pub struct TokenBucket {
+    rate_bps: u64, burst: u64,
+    tokens: u64, last_us: u64,
 }
 
-impl BandwidthThrottle {
-    pub fn new(host: str, port: int) -> BandwidthThrottle {
-        return BandwidthThrottle { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_bucket(rate_bps: u64, burst: u64) -> TokenBucket {
+    return TokenBucket { rate_bps: rate_bps, burst: burst, tokens: burst, last_us: 0 }
 }
 
-async fn main() {
-    let conn = BandwidthThrottle .new("127.0.0.1", 8080)
-    println("Bandwidth Throttler ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn refill(b: &mut TokenBucket, now_us: u64) {
+    if now_us <= b.last_us { return }
+    let dt: u64 = now_us - b.last_us
+    let added: u64 = (b.rate_bps * dt) / 1000000
+    b.tokens = b.tokens + added
+    if b.tokens > b.burst { b.tokens = b.burst }
+    b.last_us = now_us
+}
+
+// Returns (allowed, wait_us_until_possible).
+pub fn try_send(b: &mut TokenBucket, now_us: u64, bytes: u64) -> (bool, u64) {
+    refill(b, now_us)
+    if b.tokens >= bytes { b.tokens = b.tokens - bytes; return (true, 0) }
+    let deficit: u64 = bytes - b.tokens
+    let wait_us: u64 = (deficit * 1000000) / b.rate_bps
+    return (false, wait_us)
+}
+
+pub fn main() {
+    // 1 MB/s = 1 000 000 bytes/s, burst 500 KB.
+    let mut b: TokenBucket = new_bucket(1000000, 500000)
+    let (ok1, _): (bool, u64) = try_send(&mut b, 0, 100000)
+    print("send 100K at t=0: ok=", ok1, " tokens=", b.tokens)
+    let (ok2, w2): (bool, u64) = try_send(&mut b, 0, 500000)
+    print("send 500K more at t=0: ok=", ok2, " wait_us=", w2)
+    let (ok3, _): (bool, u64) = try_send(&mut b, 1000000, 500000)
+    print("retry at t=1s: ok=", ok3, " tokens=", b.tokens)
 }
