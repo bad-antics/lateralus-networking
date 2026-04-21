@@ -1,39 +1,77 @@
-// NAT Table
-module networking.utilities.nat_table
+// utilities/nat_table.ltl
+// Source-NAT mapping table (stateful NAPT, RFC 2663/3022).
+// Maps (internal_ip, internal_port, proto) <-> (external_port).
+// Uses a linear-probing hash with (src_ip, src_port, proto) key.
+
+module utilities.nat_table
+
+pub struct NatEntry {
+    in_ip: u32, in_port: u16, proto: u8,
+    ext_port: u16, expires_at: u64, used: bool,
+}
 
 pub struct NatTable {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+    cap: u64, clock: u64, next_port: u16, ttl: u64,
+    slots: [NatEntry],
 }
 
-impl NatTable {
-    pub fn new(host: str, port: int) -> NatTable {
-        return NatTable { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_table(cap: u64, ttl: u64) -> NatTable {
+    let empty: NatEntry = NatEntry { in_ip: 0, in_port: 0, proto: 0, ext_port: 0, expires_at: 0, used: false }
+    let mut s: [NatEntry] = []
+    let mut i: u64 = 0
+    while i < cap { s.push(empty); i = i + 1 }
+    return NatTable { cap: cap, clock: 0, next_port: 49152, ttl: ttl, slots: s }
 }
 
-async fn main() {
-    let conn = NatTable .new("127.0.0.1", 8080)
-    println("NAT Table ready for host=" + conn.host + " port=" + conn.port as str)
+fn hash_key(ip: u32, port: u16, proto: u8) -> u64 {
+    let mut h: u64 = (ip as u64) ^ ((port as u64) << 16) ^ (proto as u64)
+    h = h ^ (h >> 33); h = h * 0xFF51AFD7ED558CCD
+    h = h ^ (h >> 33); h = h * 0xC4CEB9FE1A85EC53; h = h ^ (h >> 33)
+    return h
+}
+
+pub fn tick(t: &mut NatTable) { t.clock = t.clock + 1 }
+
+// Returns allocated external port.
+pub fn map_flow(t: &mut NatTable, ip: u32, port: u16, proto: u8) -> u16 {
+    tick(t)
+    let mut idx: u64 = hash_key(ip, port, proto) % t.cap
+    let start: u64 = idx
+    while true {
+        if !t.slots[idx].used || t.slots[idx].expires_at <= t.clock {
+            let ext: u16 = t.next_port
+            t.next_port = t.next_port + 1
+            if t.next_port == 0 { t.next_port = 49152 }
+            t.slots[idx] = NatEntry { in_ip: ip, in_port: port, proto: proto,
+                                      ext_port: ext, expires_at: t.clock + t.ttl, used: true }
+            return ext
+        }
+        if t.slots[idx].in_ip == ip && t.slots[idx].in_port == port && t.slots[idx].proto == proto {
+            t.slots[idx].expires_at = t.clock + t.ttl
+            return t.slots[idx].ext_port
+        }
+        idx = (idx + 1) % t.cap
+        if idx == start { return 0 }
+    }
+    return 0
+}
+
+// Reverse lookup by external port.
+pub fn reverse(t: NatTable, ext_port: u16) -> (bool, u32, u16, u8) {
+    let mut i: u64 = 0
+    while i < t.cap {
+        if t.slots[i].used && t.slots[i].expires_at > t.clock && t.slots[i].ext_port == ext_port {
+            return (true, t.slots[i].in_ip, t.slots[i].in_port, t.slots[i].proto)
+        }
+        i = i + 1
+    }
+    return (false, 0, 0, 0)
+}
+
+pub fn main() {
+    let mut t: NatTable = new_table(16, 30)
+    let ext: u16 = map_flow(&mut t, 0x0A000001, 44321, 6)
+    print("allocated ext port=", ext)
+    let (ok, ip, p, pr): (bool, u32, u16, u8) = reverse(t, ext)
+    print("reverse ok=", ok, " -> ip=0x", ip, " port=", p, " proto=", pr)
 }
