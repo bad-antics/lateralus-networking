@@ -1,39 +1,78 @@
-// TLS Handshake
-module networking.transport.tls_handshake
+// transport/tls_handshake.ltl
+// TLS 1.3 handshake state machine (RFC 8446 fig 1).
+//   CLIENT: START -> WAIT_SH -> WAIT_EE -> WAIT_CERT_CR -> WAIT_CERT ->
+//           WAIT_CV -> WAIT_FINISHED -> CONNECTED.
+// Only the control flow is modelled here; cryptographic operations
+// are represented by opaque blob hashes.
 
-pub struct TlsHandshake {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module transport.tls_handshake
+
+pub const ST_START:         u8 = 0
+pub const ST_WAIT_SH:       u8 = 1
+pub const ST_WAIT_EE:       u8 = 2
+pub const ST_WAIT_CERT:     u8 = 3
+pub const ST_WAIT_CV:       u8 = 4
+pub const ST_WAIT_FINISHED: u8 = 5
+pub const ST_CONNECTED:     u8 = 6
+pub const ST_ERROR:         u8 = 255
+
+pub struct TlsClient {
+    state: u8,
+    version: u16, cipher_suite: u16,
+    transcript: u64,              // running hash (opaque)
 }
 
-impl TlsHandshake {
-    pub fn new(host: str, port: int) -> TlsHandshake {
-        return TlsHandshake { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_client() -> TlsClient {
+    return TlsClient { state: ST_START, version: 0x0304, cipher_suite: 0, transcript: 0 }
 }
 
-async fn main() {
-    let conn = TlsHandshake .new("127.0.0.1", 8080)
-    println("TLS Handshake ready for host=" + conn.host + " port=" + conn.port as str)
+fn mix(h: u64, x: u64) -> u64 {
+    let mut t: u64 = h ^ x
+    t = t ^ (t >> 33); t = t * 0xFF51AFD7ED558CCD
+    t = t ^ (t >> 33); t = t * 0xC4CEB9FE1A85EC53; t = t ^ (t >> 33)
+    return t
+}
+
+pub fn send_client_hello(c: &mut TlsClient) {
+    if c.state != ST_START { c.state = ST_ERROR; return }
+    c.transcript = mix(c.transcript, 0x01)
+    c.state = ST_WAIT_SH
+}
+
+pub fn on_server_hello(c: &mut TlsClient, cipher: u16) {
+    if c.state != ST_WAIT_SH { c.state = ST_ERROR; return }
+    c.cipher_suite = cipher
+    c.transcript = mix(c.transcript, 0x02 ^ (cipher as u64))
+    c.state = ST_WAIT_EE
+}
+
+pub fn on_encrypted_extensions(c: &mut TlsClient) {
+    if c.state != ST_WAIT_EE { c.state = ST_ERROR; return }
+    c.transcript = mix(c.transcript, 0x08); c.state = ST_WAIT_CERT
+}
+
+pub fn on_certificate(c: &mut TlsClient) {
+    if c.state != ST_WAIT_CERT { c.state = ST_ERROR; return }
+    c.transcript = mix(c.transcript, 0x0B); c.state = ST_WAIT_CV
+}
+
+pub fn on_cert_verify(c: &mut TlsClient) {
+    if c.state != ST_WAIT_CV { c.state = ST_ERROR; return }
+    c.transcript = mix(c.transcript, 0x0F); c.state = ST_WAIT_FINISHED
+}
+
+pub fn on_server_finished(c: &mut TlsClient) {
+    if c.state != ST_WAIT_FINISHED { c.state = ST_ERROR; return }
+    c.transcript = mix(c.transcript, 0x14); c.state = ST_CONNECTED
+}
+
+pub fn main() {
+    let mut c: TlsClient = new_client()
+    send_client_hello(&mut c)
+    on_server_hello(&mut c, 0x1301)
+    on_encrypted_extensions(&mut c)
+    on_certificate(&mut c)
+    on_cert_verify(&mut c)
+    on_server_finished(&mut c)
+    print("state=", c.state, " (expect CONNECTED 6) transcript=0x", c.transcript)
 }
