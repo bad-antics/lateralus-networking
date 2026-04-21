@@ -1,39 +1,44 @@
-// Traceroute
-module networking.utilities.traceroute
+// utilities/traceroute.ltl
+// Traceroute / Path MTU Discovery using increasing TTL (Van Jacobson 1987).
+// Sends UDP (or ICMP Echo) probes with TTL = 1, 2, ... and observes ICMP
+// Time-Exceeded from each intermediate router; stops when destination
+// replies with Port-Unreachable.
 
-pub struct Traceroute {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.traceroute
+
+pub struct Hop { ttl: u8, router_ip: u32, rtt_us: u64, timed_out: bool }
+
+// Synthetic network-layer callback interface: caller provides a function
+// that, given (dst, ttl), returns (arrived_ip, rtt, timed_out, is_dest).
+pub fn trace(dst: u32, max_hops: u8,
+             probe: fn(u32, u8) -> (u32, u64, bool, bool)) -> [Hop] {
+    let mut hops: [Hop] = []
+    let mut ttl: u8 = 1
+    while ttl <= max_hops {
+        let (ip, rtt, timeout, is_dest): (u32, u64, bool, bool) = probe(dst, ttl)
+        hops.push(Hop { ttl: ttl, router_ip: ip, rtt_us: rtt, timed_out: timeout })
+        if is_dest { return hops }
+        ttl = ttl + 1
+    }
+    return hops
 }
 
-impl Traceroute {
-    pub fn new(host: str, port: int) -> Traceroute {
-        return Traceroute { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+// Deterministic synthetic probe: hop k has IP 10.0.0.k and rtt 1000*k us.
+pub fn probe_synth(dst: u32, ttl: u8) -> (u32, u64, bool, bool) {
+    let hop_ip: u32 = 0x0A000000 | (ttl as u32)
+    let rtt: u64    = 1000 * (ttl as u64)
+    if hop_ip == dst { return (dst, rtt, false, true) }
+    if ttl == 4      { return (0, 0, true, false) }   // simulate a silent hop.
+    return (hop_ip, rtt, false, false)
 }
 
-async fn main() {
-    let conn = Traceroute .new("127.0.0.1", 8080)
-    println("Traceroute ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn main() {
+    let dst: u32 = 0x0A000006
+    let hops: [Hop] = trace(dst, 10, probe_synth)
+    let mut i: u64 = 0
+    while i < len(hops) {
+        print("ttl=", hops[i].ttl, " ip=0x", hops[i].router_ip,
+              " rtt_us=", hops[i].rtt_us, " timeout=", hops[i].timed_out)
+        i = i + 1
+    }
 }
