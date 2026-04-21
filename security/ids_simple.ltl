@@ -1,39 +1,62 @@
-// Intrusion Detection (Simplified)
-module networking.security.ids_simple
+// security/ids_simple.ltl
+// Signature-based IDS. Matches payload against a list of byte patterns
+// using the Boyer-Moore-Horspool algorithm; raises an alert on match.
+// Ref: Horspool 1980 "Practical fast searching in strings"; Snort rule model.
 
-pub struct IdsSimple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module security.ids_simple
+
+pub struct Signature { id: u32, name: str, pattern: [u8], severity: u8 }
+
+// Build BMH bad-character shift table (256 entries).
+fn bmh_table(pat: [u8]) -> [u64] {
+    let m: u64 = len(pat)
+    let mut t: [u64] = []
+    let mut i: u64 = 0
+    while i < 256 { t.push(m); i = i + 1 }
+    i = 0
+    while i + 1 < m { t[pat[i] as u64] = m - 1 - i; i = i + 1 }
+    return t
 }
 
-impl IdsSimple {
-    pub fn new(host: str, port: int) -> IdsSimple {
-        return IdsSimple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn bmh_search(hay: [u8], pat: [u8]) -> i64 {
+    let m: u64 = len(pat); let n: u64 = len(hay)
+    if m == 0 || m > n { return -1 }
+    let tbl: [u64] = bmh_table(pat)
+    let mut i: u64 = 0
+    while i <= n - m {
+        let mut j: i64 = (m - 1) as i64
+        while j >= 0 && pat[j as u64] == hay[i + j as u64] { j = j - 1 }
+        if j < 0 { return i as i64 }
+        i = i + tbl[hay[i + m - 1] as u64]
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return -1
 }
 
-async fn main() {
-    let conn = IdsSimple .new("127.0.0.1", 8080)
-    println("Intrusion Detection (Simplified) ready for host=" + conn.host + " port=" + conn.port as str)
+pub struct Alert { sig_id: u32, offset: i64, severity: u8 }
+
+pub fn scan(payload: [u8], sigs: [Signature]) -> [Alert] {
+    let mut out: [Alert] = []
+    let mut i: u64 = 0
+    while i < len(sigs) {
+        let pos: i64 = bmh_search(payload, sigs[i].pattern)
+        if pos >= 0 { out.push(Alert { sig_id: sigs[i].id, offset: pos, severity: sigs[i].severity }) }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn main() {
+    let sigs: [Signature] = [
+        Signature { id: 1001, name: "sql-tautology",    pattern: str_to_bytes("' OR 1=1"), severity: 3 },
+        Signature { id: 1002, name: "shellshock",       pattern: str_to_bytes("() { :"),   severity: 4 },
+        Signature { id: 1003, name: "path-traversal",   pattern: str_to_bytes("../../"),   severity: 2 },
+    ]
+    let payload: [u8] = str_to_bytes("GET /search?q=' OR 1=1-- HTTP/1.1")
+    let alerts: [Alert] = scan(payload, sigs)
+    print("alerts=", len(alerts))
+    let mut i: u64 = 0
+    while i < len(alerts) {
+        print("  sig=", alerts[i].sig_id, " off=", alerts[i].offset, " sev=", alerts[i].severity)
+        i = i + 1
+    }
 }
