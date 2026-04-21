@@ -1,39 +1,48 @@
-// Firewall Rules
-module networking.security.firewall_rules
+// security/firewall_rules.ltl
+// Stateless packet filter with ordered ACL rules evaluated top-down; first
+// match wins. Supports IPv4 5-tuple matching with CIDR sources/destinations,
+// protocol, and port ranges. Ref: Cisco IOS ACL semantics.
 
-pub struct FirewallRules {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module security.firewall_rules
+
+pub const ACT_ALLOW: u8 = 0
+pub const ACT_DENY:  u8 = 1
+
+pub struct Rule {
+    action: u8,
+    src_net: u32, src_prefix: u8,
+    dst_net: u32, dst_prefix: u8,
+    proto: u16,       // 0xFFFF = any
+    dport_lo: u16, dport_hi: u16,
 }
 
-impl FirewallRules {
-    pub fn new(host: str, port: int) -> FirewallRules {
-        return FirewallRules { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub struct Packet { src: u32, dst: u32, proto: u8, sport: u16, dport: u16 }
+
+fn mask(p: u8) -> u32 { if p == 0 { return 0 }; if p >= 32 { return 0xFFFFFFFF }; return 0xFFFFFFFF << (32 - p) }
+
+pub fn match_rule(r: Rule, p: Packet) -> bool {
+    let sm: u32 = mask(r.src_prefix); let dm: u32 = mask(r.dst_prefix)
+    if (p.src & sm) != (r.src_net & sm) { return false }
+    if (p.dst & dm) != (r.dst_net & dm) { return false }
+    if r.proto != 0xFFFF && (r.proto as u8) != p.proto { return false }
+    if p.dport < r.dport_lo || p.dport > r.dport_hi { return false }
+    return true
 }
 
-async fn main() {
-    let conn = FirewallRules .new("127.0.0.1", 8080)
-    println("Firewall Rules ready for host=" + conn.host + " port=" + conn.port as str)
+// Returns action (ACT_ALLOW or ACT_DENY); default deny if nothing matches.
+pub fn evaluate(rules: [Rule], p: Packet) -> u8 {
+    let mut i: u64 = 0
+    while i < len(rules) { if match_rule(rules[i], p) { return rules[i].action }; i = i + 1 }
+    return ACT_DENY
+}
+
+pub fn main() {
+    let r1: Rule = Rule { action: ACT_ALLOW, src_net: 0, src_prefix: 0, dst_net: 0, dst_prefix: 0,
+                          proto: 6, dport_lo: 22, dport_hi: 22 }     // allow any -> :22 TCP
+    let r2: Rule = Rule { action: ACT_DENY,  src_net: 0, src_prefix: 0, dst_net: 0, dst_prefix: 0,
+                          proto: 0xFFFF, dport_lo: 0, dport_hi: 65535 } // default deny
+    let pkt_ssh: Packet = Packet { src: 0x0A000001, dst: 0x0A000002, proto: 6, sport: 55000, dport: 22 }
+    let pkt_http: Packet = Packet { src: 0x0A000001, dst: 0x0A000002, proto: 6, sport: 55000, dport: 80 }
+    print("ssh:  action=", evaluate([r1, r2], pkt_ssh),  " (expect ALLOW 0)")
+    print("http: action=", evaluate([r1, r2], pkt_http), " (expect DENY 1)")
 }
