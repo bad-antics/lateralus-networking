@@ -1,39 +1,68 @@
-// FTP Client
-module networking.application.ftp_client
+// application/ftp_client.ltl
+// FTP control-channel state machine (RFC 959).
+// Command sequence: USER -> PASS -> (PWD/CWD/TYPE) -> PASV -> RETR/STOR -> QUIT.
+// Response codes: 1xx preliminary, 2xx complete, 3xx intermediate,
+// 4xx transient failure, 5xx permanent failure.
 
-pub struct FtpClient {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.ftp_client
+
+pub const ST_DISCONNECTED: u8 = 0
+pub const ST_CONNECTED:    u8 = 1
+pub const ST_USER_SENT:    u8 = 2
+pub const ST_LOGGED_IN:    u8 = 3
+pub const ST_TRANSFER:     u8 = 4
+
+pub struct FtpClient { state: u8, data_ip: u32, data_port: u16, binary_mode: bool }
+
+pub fn new_client() -> FtpClient {
+    return FtpClient { state: ST_DISCONNECTED, data_ip: 0, data_port: 0, binary_mode: false }
 }
 
-impl FtpClient {
-    pub fn new(host: str, port: int) -> FtpClient {
-        return FtpClient { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn on_greeting(c: &mut FtpClient, code: u16) {
+    if code == 220 { c.state = ST_CONNECTED }
 }
 
-async fn main() {
-    let conn = FtpClient .new("127.0.0.1", 8080)
-    println("FTP Client ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn send_user(c: &mut FtpClient) -> bool {
+    if c.state != ST_CONNECTED { return false }
+    c.state = ST_USER_SENT; return true
+}
+
+pub fn on_user_reply(c: &mut FtpClient, code: u16) {
+    if c.state != ST_USER_SENT { return }
+    if code == 230 { c.state = ST_LOGGED_IN }     // no-password login
+    // 331: need password. Stay in USER_SENT until PASS reply 230.
+}
+
+pub fn on_pass_reply(c: &mut FtpClient, code: u16) {
+    if code == 230 { c.state = ST_LOGGED_IN }
+}
+
+// Parse PASV response "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)".
+pub fn on_pasv(c: &mut FtpClient, nums: [u16]) -> bool {
+    if len(nums) != 6 { return false }
+    c.data_ip = ((nums[0] as u32) << 24) | ((nums[1] as u32) << 16)
+              | ((nums[2] as u32) <<  8) |  (nums[3] as u32)
+    c.data_port = (nums[4] << 8) | nums[5]
+    return true
+}
+
+pub fn send_retr(c: &mut FtpClient) -> bool {
+    if c.state != ST_LOGGED_IN { return false }
+    if c.data_port == 0 { return false }
+    c.state = ST_TRANSFER; return true
+}
+
+pub fn on_transfer_complete(c: &mut FtpClient, code: u16) {
+    if code == 226 && c.state == ST_TRANSFER { c.state = ST_LOGGED_IN }
+}
+
+pub fn main() {
+    let mut c: FtpClient = new_client()
+    on_greeting(&mut c, 220)
+    send_user(&mut c); on_user_reply(&mut c, 331); on_pass_reply(&mut c, 230)
+    print("logged_in state=", c.state, " (expect LOGGED_IN 3)")
+    on_pasv(&mut c, [192, 168, 1, 10, 195, 149])
+    print("data ip=0x", c.data_ip, " port=", c.data_port, " (expected 50069)")
+    send_retr(&mut c); on_transfer_complete(&mut c, 226)
+    print("after transfer state=", c.state)
 }
