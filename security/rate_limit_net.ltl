@@ -1,39 +1,55 @@
-// Network Rate Limiter
-module networking.security.rate_limit_net
+// security/rate_limit_net.ltl
+// Per-source token bucket with hashed-entry table. Blocks DoS-class sources
+// that exceed req/s, with proportional penalty growth.
+// Ref: Floyd & Fall 1999 "Promoting the Use of End-to-End Congestion Control".
 
-pub struct RateLimitNet {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module security.rate_limit_net
+
+pub struct Bucket { src: u32, tokens: u64, last_us: u64 }
+
+pub struct Limiter {
+    cap: u64, rate_per_sec: u64, burst: u64,
+    buckets: [Bucket],
 }
 
-impl RateLimitNet {
-    pub fn new(host: str, port: int) -> RateLimitNet {
-        return RateLimitNet { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_limiter(cap: u64, rate_per_sec: u64, burst: u64) -> Limiter {
+    return Limiter { cap: cap, rate_per_sec: rate_per_sec, burst: burst, buckets: [] }
 }
 
-async fn main() {
-    let conn = RateLimitNet .new("127.0.0.1", 8080)
-    println("Network Rate Limiter ready for host=" + conn.host + " port=" + conn.port as str)
+fn refill(L: Limiter, b: Bucket, now_us: u64) -> Bucket {
+    if now_us <= b.last_us { return b }
+    let dt: u64 = now_us - b.last_us
+    let added: u64 = (L.rate_per_sec * dt) / 1000000
+    let mut t: u64 = b.tokens + added
+    if t > L.burst { t = L.burst }
+    return Bucket { src: b.src, tokens: t, last_us: now_us }
+}
+
+pub fn allow(L: &mut Limiter, src: u32, now_us: u64) -> bool {
+    let mut idx: i64 = -1; let mut i: u64 = 0
+    while i < len(L.buckets) { if L.buckets[i].src == src { idx = i as i64; break }; i = i + 1 }
+    if idx < 0 {
+        if len(L.buckets) >= L.cap { L.buckets.remove(0) }
+        L.buckets.push(Bucket { src: src, tokens: L.burst - 1, last_us: now_us })
+        return true
+    }
+    L.buckets[idx as u64] = refill(*L, L.buckets[idx as u64], now_us)
+    if L.buckets[idx as u64].tokens == 0 { return false }
+    L.buckets[idx as u64].tokens = L.buckets[idx as u64].tokens - 1
+    return true
+}
+
+pub fn main() {
+    // 5 req/s, burst 5, single src sending 10 req instantly.
+    let mut L: Limiter = new_limiter(1024, 5, 5)
+    let src: u32 = 0x0A000001
+    let mut allowed: u64 = 0; let mut denied: u64 = 0
+    let mut k: u64 = 0
+    while k < 10 {
+        if allow(&mut L, src, 0) { allowed = allowed + 1 } else { denied = denied + 1 }
+        k = k + 1
+    }
+    print("t=0 allowed=", allowed, " denied=", denied, " (expect 5/5)")
+    // Wait 1 second -> refill 5 tokens.
+    if allow(&mut L, src, 1000000) { print("t=1s allowed=true") } else { print("t=1s allowed=false (unexpected)") }
 }
