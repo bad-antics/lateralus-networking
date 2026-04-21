@@ -1,39 +1,69 @@
-// HTTP/2 Frame Parser
-module networking.application.http2_simple
+// application/http2_simple.ltl
+// HTTP/2 frame framing (RFC 9113 sec 4). Frame layout:
+//   Length(24) Type(8) Flags(8) R(1)+StreamID(31) + Payload
+// We implement: HEADERS, DATA, PING, GOAWAY, WINDOW_UPDATE.
 
-pub struct Http2Simple {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module application.http2_simple
+
+pub const FRAME_DATA:          u8 = 0x00
+pub const FRAME_HEADERS:       u8 = 0x01
+pub const FRAME_PING:          u8 = 0x06
+pub const FRAME_GOAWAY:        u8 = 0x07
+pub const FRAME_WINDOW_UPDATE: u8 = 0x08
+
+pub const FLAG_END_STREAM:  u8 = 0x01
+pub const FLAG_END_HEADERS: u8 = 0x04
+pub const FLAG_ACK:         u8 = 0x01
+
+pub fn build_frame(ftype: u8, flags: u8, stream_id: u32, payload: [u8]) -> [u8] {
+    let plen: u64 = len(payload)
+    let mut buf: [u8] = u8_zeros(9 + plen)
+    buf[0] = ((plen >> 16) & 0xFF) as u8
+    buf[1] = ((plen >>  8) & 0xFF) as u8
+    buf[2] = ( plen        & 0xFF) as u8
+    buf[3] = ftype; buf[4] = flags
+    let s: u32 = stream_id & 0x7FFFFFFF
+    buf[5] = ((s >> 24) & 0xFF) as u8
+    buf[6] = ((s >> 16) & 0xFF) as u8
+    buf[7] = ((s >>  8) & 0xFF) as u8
+    buf[8] = ( s        & 0xFF) as u8
+    let mut i: u64 = 0
+    while i < plen { buf[9 + i] = payload[i]; i = i + 1 }
+    return buf
 }
 
-impl Http2Simple {
-    pub fn new(host: str, port: int) -> Http2Simple {
-        return Http2Simple { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub struct Frame { length: u32, ftype: u8, flags: u8, stream_id: u32, payload: [u8] }
+
+pub fn parse_frame(buf: [u8]) -> (Frame, u64) {
+    let length: u32 = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | (buf[2] as u32)
+    let ftype: u8 = buf[3]; let flags: u8 = buf[4]
+    let sid: u32 = (((buf[5] & 0x7F) as u32) << 24) | ((buf[6] as u32) << 16)
+                 | ((buf[7] as u32) << 8) | (buf[8] as u32)
+    let mut p: [u8] = u8_zeros(length as u64)
+    let mut i: u64 = 0
+    while i < (length as u64) { p[i] = buf[9 + i]; i = i + 1 }
+    return (Frame { length: length, ftype: ftype, flags: flags, stream_id: sid, payload: p }, 9 + length as u64)
 }
 
-async fn main() {
-    let conn = Http2Simple .new("127.0.0.1", 8080)
-    println("HTTP/2 Frame Parser ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn ping(data: [u8], ack: bool) -> [u8] {
+    let flags: u8 = if ack { FLAG_ACK } else { 0 }
+    return build_frame(FRAME_PING, flags, 0, data)
+}
+
+pub fn goaway(last_stream: u32, error_code: u32) -> [u8] {
+    let p: [u8] = [((last_stream >> 24) & 0xFF) as u8, ((last_stream >> 16) & 0xFF) as u8,
+                   ((last_stream >>  8) & 0xFF) as u8,  (last_stream        & 0xFF) as u8,
+                   ((error_code  >> 24) & 0xFF) as u8, ((error_code  >> 16) & 0xFF) as u8,
+                   ((error_code  >>  8) & 0xFF) as u8,  (error_code         & 0xFF) as u8]
+    return build_frame(FRAME_GOAWAY, 0, 0, p)
+}
+
+pub fn main() {
+    let hdr: [u8] = build_frame(FRAME_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, [0xAA, 0xBB])
+    print("frame len=", len(hdr))
+    let (f, consumed): (Frame, u64) = parse_frame(hdr)
+    print("type=", f.ftype, " flags=0x", f.flags, " sid=", f.stream_id, " payload=", f.payload)
+    let g: [u8] = goaway(1, 0)
+    let (gf, _): (Frame, u64) = parse_frame(g)
+    print("goaway type=", gf.ftype, " plen=", gf.length)
 }
