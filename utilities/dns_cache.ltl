@@ -1,39 +1,81 @@
-// DNS Cache
-module networking.utilities.dns_cache
+// utilities/dns_cache.ltl
+// Bounded DNS resolver cache with TTL expiry (RFC 1035 sec 3.2.1).
+// Entries keyed by (qname, qtype); evicted on TTL expiry or LRU pressure.
 
-pub struct DnsCache {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.dns_cache
+
+pub struct DnsEntry {
+    name: str, qtype: u16,
+    answer: u32,        // for A records; other types omitted for brevity
+    expires_at: u64,
+    last_used: u64,
 }
 
-impl DnsCache {
-    pub fn new(host: str, port: int) -> DnsCache {
-        return DnsCache { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub struct DnsCache { cap: u64, clock: u64, entries: [DnsEntry] }
+
+pub fn new_cache(cap: u64) -> DnsCache {
+    return DnsCache { cap: cap, clock: 0, entries: [] }
 }
 
-async fn main() {
-    let conn = DnsCache .new("127.0.0.1", 8080)
-    println("DNS Cache ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn tick(c: &mut DnsCache) { c.clock = c.clock + 1 }
+
+pub fn put(c: &mut DnsCache, name: str, qtype: u16, answer: u32, ttl: u64) {
+    tick(c)
+    // purge expired.
+    let mut kept: [DnsEntry] = []
+    let mut i: u64 = 0
+    while i < len(c.entries) {
+        if c.entries[i].expires_at > c.clock { kept.push(c.entries[i]) }
+        i = i + 1
+    }
+    c.entries = kept
+    // replace existing.
+    i = 0
+    while i < len(c.entries) {
+        if c.entries[i].name == name && c.entries[i].qtype == qtype {
+            c.entries[i].answer = answer
+            c.entries[i].expires_at = c.clock + ttl
+            c.entries[i].last_used  = c.clock
+            return
+        }
+        i = i + 1
+    }
+    // evict LRU if needed.
+    if len(c.entries) >= c.cap {
+        let mut lru: u64 = 0; i = 1
+        while i < len(c.entries) {
+            if c.entries[i].last_used < c.entries[lru].last_used { lru = i }
+            i = i + 1
+        }
+        c.entries.remove(lru)
+    }
+    c.entries.push(DnsEntry { name: name, qtype: qtype, answer: answer,
+                              expires_at: c.clock + ttl, last_used: c.clock })
+}
+
+pub fn get(c: &mut DnsCache, name: str, qtype: u16) -> (bool, u32) {
+    tick(c)
+    let mut i: u64 = 0
+    while i < len(c.entries) {
+        if c.entries[i].name == name && c.entries[i].qtype == qtype {
+            if c.entries[i].expires_at <= c.clock {
+                c.entries.remove(i); return (false, 0)
+            }
+            c.entries[i].last_used = c.clock
+            return (true, c.entries[i].answer)
+        }
+        i = i + 1
+    }
+    return (false, 0)
+}
+
+pub fn main() {
+    let mut c: DnsCache = new_cache(2)
+    put(&mut c, "a.example", 1, 0x0A000001, 100)
+    put(&mut c, "b.example", 1, 0x0A000002, 100)
+    let (ok, ip): (bool, u32) = get(&mut c, "a.example", 1)
+    print("a=", ok, " ip=0x", ip)
+    put(&mut c, "c.example", 1, 0x0A000003, 100)  // evicts b (LRU).
+    let (ok2, _): (bool, u32) = get(&mut c, "b.example", 1)
+    print("b present? ", ok2, " (expected false after LRU eviction)")
 }
