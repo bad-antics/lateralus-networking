@@ -1,39 +1,54 @@
-// Network Monitor
-module networking.utilities.network_monitor
+// utilities/network_monitor.ltl
+// Sliding-window bandwidth monitor: tracks bytes/sec and packets/sec with
+// a ring buffer of per-second buckets; raises an alarm above a threshold.
 
-pub struct NetworkMonitor {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.network_monitor
+
+pub struct Bucket { bytes: u64, pkts: u64 }
+pub struct Monitor {
+    window: u64, idx: u64, now: u64,
+    buckets: [Bucket],
+    byte_threshold: u64,
 }
 
-impl NetworkMonitor {
-    pub fn new(host: str, port: int) -> NetworkMonitor {
-        return NetworkMonitor { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_monitor(window: u64, threshold: u64) -> Monitor {
+    let zero: Bucket = Bucket { bytes: 0, pkts: 0 }
+    let mut b: [Bucket] = []; let mut i: u64 = 0
+    while i < window { b.push(zero); i = i + 1 }
+    return Monitor { window: window, idx: 0, now: 0, buckets: b, byte_threshold: threshold }
 }
 
-async fn main() {
-    let conn = NetworkMonitor .new("127.0.0.1", 8080)
-    println("Network Monitor ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn advance_time(m: &mut Monitor, new_now: u64) {
+    while m.now < new_now {
+        m.now = m.now + 1
+        m.idx = (m.idx + 1) % m.window
+        m.buckets[m.idx] = Bucket { bytes: 0, pkts: 0 }
+    }
+}
+
+pub fn record(m: &mut Monitor, now: u64, bytes: u64) {
+    advance_time(m, now)
+    m.buckets[m.idx].bytes = m.buckets[m.idx].bytes + bytes
+    m.buckets[m.idx].pkts  = m.buckets[m.idx].pkts + 1
+}
+
+pub fn totals(m: Monitor) -> (u64, u64) {
+    let mut tb: u64 = 0; let mut tp: u64 = 0
+    let mut i: u64 = 0
+    while i < m.window { tb = tb + m.buckets[i].bytes; tp = tp + m.buckets[i].pkts; i = i + 1 }
+    return (tb, tp)
+}
+
+pub fn over_threshold(m: Monitor) -> bool {
+    let (tb, _): (u64, u64) = totals(m)
+    return tb > m.byte_threshold
+}
+
+pub fn main() {
+    let mut m: Monitor = new_monitor(5, 1000)
+    record(&mut m, 1, 200); record(&mut m, 1, 300)
+    record(&mut m, 2, 400); record(&mut m, 3, 50)
+    let (tb, tp): (u64, u64) = totals(m)
+    print("bytes=", tb, " pkts=", tp, " alarm=", over_threshold(m))
+    record(&mut m, 3, 200); print("after 200 more alarm=", over_threshold(m))
 }
