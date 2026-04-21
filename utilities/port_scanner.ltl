@@ -1,39 +1,52 @@
-// Port Scanner
-module networking.utilities.port_scanner
+// utilities/port_scanner.ltl
+// TCP connect() port scanner. Attempts a full handshake on each port in a
+// caller-supplied list; closes the socket immediately. No SYN-stealth here
+// (that requires raw sockets/root). Ref: Nmap book ch. 5 (Lyon 2009).
 
-pub struct PortScanner {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.port_scanner
+
+pub struct ScanResult { port: u16, open: bool, latency_us: u64 }
+
+// Caller provides a connect callback: (ip, port) -> (ok, latency_us).
+pub fn scan(ip: u32, ports: [u16], timeout_us: u64,
+            connect: fn(u32, u16, u64) -> (bool, u64)) -> [ScanResult] {
+    let n: u64 = len(ports)
+    let mut out: [ScanResult] = []
+    let mut i: u64 = 0
+    while i < n {
+        let (ok, lat): (bool, u64) = connect(ip, ports[i], timeout_us)
+        out.push(ScanResult { port: ports[i], open: ok, latency_us: lat })
+        i = i + 1
+    }
+    return out
 }
 
-impl PortScanner {
-    pub fn new(host: str, port: int) -> PortScanner {
-        return PortScanner { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+// Synthetic connect: ports 22, 80, 443 are open; others time out.
+pub fn connect_synth(ip: u32, port: u16, timeout_us: u64) -> (bool, u64) {
+    if port == 22 || port == 80 || port == 443 {
+        return (true, 1500 + (port as u64))
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+    return (false, timeout_us)
 }
 
-async fn main() {
-    let conn = PortScanner .new("127.0.0.1", 8080)
-    println("Port Scanner ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn summarise(results: [ScanResult]) -> (u64, u64) {
+    let mut open_n: u64 = 0; let mut closed_n: u64 = 0
+    let mut i: u64 = 0
+    while i < len(results) {
+        if results[i].open { open_n = open_n + 1 } else { closed_n = closed_n + 1 }
+        i = i + 1
+    }
+    return (open_n, closed_n)
+}
+
+pub fn main() {
+    let ports: [u16] = [21, 22, 23, 80, 443, 8080]
+    let r: [ScanResult] = scan(0x7F000001, ports, 3000000, connect_synth)
+    let (o, c): (u64, u64) = summarise(r)
+    print("open=", o, " closed=", c)
+    let mut i: u64 = 0
+    while i < len(r) {
+        print("port ", r[i].port, " open=", r[i].open, " lat_us=", r[i].latency_us)
+        i = i + 1
+    }
 }
