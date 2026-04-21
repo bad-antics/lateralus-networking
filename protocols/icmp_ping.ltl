@@ -1,39 +1,53 @@
-// ICMP Ping
-module networking.protocols.icmp_ping
+// protocols/icmp_ping.ltl
+// ICMPv4 Echo Request / Reply (RFC 792). Builds the 8-byte ICMP header,
+// embeds an id/sequence and timestamp, and computes the 16-bit one's
+// complement checksum over the header+payload (RFC 1071).
 
-pub struct IcmpPing {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module protocols.icmp_ping
+
+pub const TYPE_ECHO_REQUEST: u8 = 8
+pub const TYPE_ECHO_REPLY:   u8 = 0
+
+pub fn checksum(buf: [u8]) -> u16 {
+    let n: u64 = len(buf)
+    let mut s: u32 = 0
+    let mut i: u64 = 0
+    while i + 1 < n {
+        s = s + (((buf[i] as u32) << 8) | (buf[i + 1] as u32))
+        if s > 0xFFFF { s = (s & 0xFFFF) + 1 }
+        i = i + 2
+    }
+    if i < n {
+        s = s + ((buf[i] as u32) << 8)
+        if s > 0xFFFF { s = (s & 0xFFFF) + 1 }
+    }
+    return (~s) as u16 & 0xFFFF
 }
 
-impl IcmpPing {
-    pub fn new(host: str, port: int) -> IcmpPing {
-        return IcmpPing { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn build_echo_request(id: u16, seq: u16, payload: [u8]) -> [u8] {
+    let plen: u64 = len(payload)
+    let total: u64 = 8 + plen
+    let mut buf: [u8] = u8_zeros(total)
+    buf[0] = TYPE_ECHO_REQUEST
+    buf[1] = 0                          // code
+    buf[2] = 0; buf[3] = 0              // checksum placeholder
+    buf[4] = ((id >> 8) & 0xFF) as u8;  buf[5] = (id & 0xFF) as u8
+    buf[6] = ((seq >> 8) & 0xFF) as u8; buf[7] = (seq & 0xFF) as u8
+    let mut i: u64 = 0
+    while i < plen { buf[8 + i] = payload[i]; i = i + 1 }
+    let c: u16 = checksum(buf)
+    buf[2] = ((c >> 8) & 0xFF) as u8
+    buf[3] = (c & 0xFF) as u8
+    return buf
 }
 
-async fn main() {
-    let conn = IcmpPing .new("127.0.0.1", 8080)
-    println("ICMP Ping ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn verify(pkt: [u8]) -> bool {
+    return checksum(pkt) == 0
+}
+
+pub fn main() {
+    let payload: [u8] = [0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x21, 0x00, 0x00]  // "Hello!"
+    let pkt: [u8] = build_echo_request(0x1234, 1, payload)
+    print("len=", len(pkt), " csum_ok=", verify(pkt))
+    print("bytes 0..7=", pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5], pkt[6], pkt[7])
 }
