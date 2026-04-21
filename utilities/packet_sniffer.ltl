@@ -1,39 +1,60 @@
-// Packet Sniffer
-module networking.utilities.packet_sniffer
+// utilities/packet_sniffer.ltl
+// Ethernet/IPv4 packet dissector. Parses headers into structured form and
+// computes the one's-complement IP header checksum per RFC 1071.
 
-pub struct PacketSniffer {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module utilities.packet_sniffer
+
+pub struct EthHdr { dst_mac: [u8], src_mac: [u8], ethertype: u16 }
+pub struct Ip4Hdr { ihl: u8, tos: u8, total_len: u16, id: u16, flags_frag: u16,
+                    ttl: u8, proto: u8, checksum: u16, src: u32, dst: u32 }
+
+pub fn parse_eth(buf: [u8]) -> EthHdr {
+    let mut dm: [u8] = u8_zeros(6); let mut sm: [u8] = u8_zeros(6)
+    let mut i: u64 = 0
+    while i < 6 { dm[i] = buf[i]; sm[i] = buf[i + 6]; i = i + 1 }
+    let et: u16 = ((buf[12] as u16) << 8) | (buf[13] as u16)
+    return EthHdr { dst_mac: dm, src_mac: sm, ethertype: et }
 }
 
-impl PacketSniffer {
-    pub fn new(host: str, port: int) -> PacketSniffer {
-        return PacketSniffer { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
+pub fn parse_ip4(buf: [u8], off: u64) -> Ip4Hdr {
+    return Ip4Hdr {
+        ihl: buf[off] & 0x0F,
+        tos: buf[off + 1],
+        total_len:  ((buf[off + 2] as u16) << 8) | (buf[off + 3] as u16),
+        id:         ((buf[off + 4] as u16) << 8) | (buf[off + 5] as u16),
+        flags_frag: ((buf[off + 6] as u16) << 8) | (buf[off + 7] as u16),
+        ttl:   buf[off + 8],
+        proto: buf[off + 9],
+        checksum: ((buf[off + 10] as u16) << 8) | (buf[off + 11] as u16),
+        src: ((buf[off + 12] as u32) << 24) | ((buf[off + 13] as u32) << 16)
+           | ((buf[off + 14] as u32) << 8)  |  (buf[off + 15] as u32),
+        dst: ((buf[off + 16] as u32) << 24) | ((buf[off + 17] as u32) << 16)
+           | ((buf[off + 18] as u32) << 8)  |  (buf[off + 19] as u32),
     }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
 }
 
-async fn main() {
-    let conn = PacketSniffer .new("127.0.0.1", 8080)
-    println("Packet Sniffer ready for host=" + conn.host + " port=" + conn.port as str)
+// RFC 1071 one's-complement checksum over an even-length byte buffer.
+pub fn ip_checksum(buf: [u8], off: u64, len_bytes: u64) -> u16 {
+    let mut s: u32 = 0
+    let mut i: u64 = 0
+    while i + 1 < len_bytes {
+        let w: u32 = ((buf[off + i] as u32) << 8) | (buf[off + i + 1] as u32)
+        s = s + w
+        if s > 0xFFFF { s = (s & 0xFFFF) + 1 }
+        i = i + 2
+    }
+    if i < len_bytes {
+        s = s + ((buf[off + i] as u32) << 8)
+        if s > 0xFFFF { s = (s & 0xFFFF) + 1 }
+    }
+    return (~s) as u16 & 0xFFFF
+}
+
+pub fn main() {
+    // Minimal IPv4 header with known checksum = 0xB861 (example RFC 1071).
+    let hdr: [u8] = [0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
+                     0x40, 0x11, 0x00, 0x00, 0xC0, 0xA8, 0x00, 0x01,
+                     0xC0, 0xA8, 0x00, 0xC7]
+    let csum: u16 = ip_checksum(hdr, 0, 20)
+    print("csum=0x", csum, " (expected 0xB861)")
 }
