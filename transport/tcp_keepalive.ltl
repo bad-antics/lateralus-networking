@@ -1,39 +1,57 @@
-// TCP Keepalive
-module networking.transport.tcp_keepalive
+// transport/tcp_keepalive.ltl
+// TCP keepalive timer per RFC 1122 sec 4.2.3.6.
+// After `idle_secs` of silence, send up to `probes` keepalives spaced
+// `interval_secs` apart. If all probes go unanswered, the connection is
+// declared dead.
 
-pub struct TcpKeepalive {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module transport.tcp_keepalive
+
+pub const ST_ALIVE:    u8 = 0
+pub const ST_PROBING:  u8 = 1
+pub const ST_DEAD:     u8 = 2
+
+pub struct Keepalive {
+    idle: u64, interval: u64, max_probes: u64,
+    last_activity: u64, last_probe: u64, probes_sent: u64, state: u8,
 }
 
-impl TcpKeepalive {
-    pub fn new(host: str, port: int) -> TcpKeepalive {
-        return TcpKeepalive { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_keepalive(idle: u64, interval: u64, max_probes: u64) -> Keepalive {
+    return Keepalive { idle: idle, interval: interval, max_probes: max_probes,
+                       last_activity: 0, last_probe: 0, probes_sent: 0, state: ST_ALIVE }
 }
 
-async fn main() {
-    let conn = TcpKeepalive .new("127.0.0.1", 8080)
-    println("TCP Keepalive ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn on_activity(k: &mut Keepalive, now: u64) {
+    k.last_activity = now; k.probes_sent = 0; k.state = ST_ALIVE
+}
+
+// Called periodically. Returns true if a keepalive probe must be transmitted now.
+pub fn tick(k: &mut Keepalive, now: u64) -> bool {
+    if k.state == ST_DEAD { return false }
+    if k.state == ST_ALIVE {
+        if now >= k.last_activity + k.idle {
+            k.state = ST_PROBING
+            k.last_probe = now
+            k.probes_sent = 1
+            return true
+        }
+        return false
+    }
+    // PROBING
+    if now >= k.last_probe + k.interval {
+        if k.probes_sent >= k.max_probes { k.state = ST_DEAD; return false }
+        k.probes_sent = k.probes_sent + 1
+        k.last_probe = now
+        return true
+    }
+    return false
+}
+
+pub fn main() {
+    let mut k: Keepalive = new_keepalive(100, 10, 3)
+    on_activity(&mut k, 0)
+    print("at 50 probe? ", tick(&mut k, 50), " state=", k.state)
+    print("at 100 probe?", tick(&mut k, 100), " state=", k.state)
+    print("at 110 probe?", tick(&mut k, 110))
+    print("at 120 probe?", tick(&mut k, 120), " sent=", k.probes_sent)
+    print("at 130 probe?", tick(&mut k, 130), " state=", k.state, " (expect DEAD 2)")
 }
