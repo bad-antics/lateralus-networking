@@ -1,39 +1,93 @@
-// Connection Pool
-module networking.transport.connection_pool_net
+// transport/connection_pool_net.ltl
+// Generic TCP connection pool. Max N concurrent + M idle; acquire blocks
+// (conceptually) when saturated, releases mark idle for re-use within TTL.
+// Aligns with HikariCP / Go database/sql pool semantics.
 
-pub struct ConnectionPoolNet {
-    host: str
-    port: int
-    connected: bool
-    stats: map
+module transport.connection_pool_net
+
+pub const ST_IDLE:   u8 = 0
+pub const ST_IN_USE: u8 = 1
+pub const ST_BROKEN: u8 = 2
+
+pub struct Conn { id: u64, remote_ip: u32, remote_port: u16, created_at: u64, last_used: u64, state: u8 }
+
+pub struct Pool {
+    max_total: u64, max_idle: u64, idle_ttl: u64,
+    clock: u64, next_id: u64,
+    conns: [Conn],
 }
 
-impl ConnectionPoolNet {
-    pub fn new(host: str, port: int) -> ConnectionPoolNet {
-        return ConnectionPoolNet { host: host, port: port, connected: false, stats: {"sent": 0, "received": 0, "errors": 0} }
-    }
-    async pub fn connect(self) -> bool {
-        let result = await tcp_connect(self.host, self.port)
-        self.connected = result
-        return result
-    }
-    async pub fn send(self, data: str) -> int {
-        if not self.connected { throw Error("Not connected") }
-        let bytes_sent = await tcp_send(data)
-        self.stats["sent"] += bytes_sent
-        return bytes_sent
-    }
-    async pub fn receive(self, max_bytes: int) -> str {
-        if not self.connected { throw Error("Not connected") }
-        let data = await tcp_recv(max_bytes)
-        self.stats["received"] += len(data)
-        return data
-    }
-    pub fn disconnect(self) { self.connected = false }
-    pub fn get_stats(self) -> map { return self.stats }
+pub fn new_pool(max_total: u64, max_idle: u64, idle_ttl: u64) -> Pool {
+    return Pool { max_total: max_total, max_idle: max_idle, idle_ttl: idle_ttl,
+                  clock: 0, next_id: 1, conns: [] }
 }
 
-async fn main() {
-    let conn = ConnectionPoolNet .new("127.0.0.1", 8080)
-    println("Connection Pool ready for host=" + conn.host + " port=" + conn.port as str)
+pub fn tick(p: &mut Pool) {
+    p.clock = p.clock + 1
+    // Evict idle conns past TTL.
+    let mut i: u64 = 0
+    while i < len(p.conns) {
+        if p.conns[i].state == ST_IDLE && p.clock - p.conns[i].last_used > p.idle_ttl {
+            p.conns.remove(i)
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Returns (ok, conn_id). Reuses idle conn if possible; else creates one if under max_total.
+pub fn acquire(p: &mut Pool, ip: u32, port: u16) -> (bool, u64) {
+    let mut i: u64 = 0
+    while i < len(p.conns) {
+        if p.conns[i].state == ST_IDLE && p.conns[i].remote_ip == ip && p.conns[i].remote_port == port {
+            p.conns[i].state = ST_IN_USE
+            p.conns[i].last_used = p.clock
+            return (true, p.conns[i].id)
+        }
+        i = i + 1
+    }
+    if len(p.conns) >= p.max_total { return (false, 0) }
+    let id: u64 = p.next_id; p.next_id = p.next_id + 1
+    p.conns.push(Conn { id: id, remote_ip: ip, remote_port: port,
+                        created_at: p.clock, last_used: p.clock, state: ST_IN_USE })
+    return (true, id)
+}
+
+pub fn release(p: &mut Pool, id: u64, broken: bool) {
+    let mut i: u64 = 0
+    while i < len(p.conns) {
+        if p.conns[i].id == id {
+            if broken { p.conns.remove(i); return }
+            p.conns[i].state = ST_IDLE
+            p.conns[i].last_used = p.clock
+            // Enforce max_idle.
+            let mut idle_count: u64 = 0; let mut j: u64 = 0
+            while j < len(p.conns) { if p.conns[j].state == ST_IDLE { idle_count = idle_count + 1 }; j = j + 1 }
+            if idle_count > p.max_idle {
+                // evict the oldest idle
+                let mut oldest: i64 = -1; j = 0
+                while j < len(p.conns) {
+                    if p.conns[j].state == ST_IDLE {
+                        if oldest < 0 || p.conns[j].last_used < p.conns[oldest as u64].last_used { oldest = j as i64 }
+                    }
+                    j = j + 1
+                }
+                if oldest >= 0 { p.conns.remove(oldest as u64) }
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+pub fn main() {
+    let mut p: Pool = new_pool(3, 1, 60)
+    let (ok1, id1): (bool, u64) = acquire(&mut p, 0x0A000001, 80)
+    let (ok2, id2): (bool, u64) = acquire(&mut p, 0x0A000001, 80)
+    print("acquire1 ok=", ok1, " id=", id1)
+    print("acquire2 ok=", ok2, " id=", id2)
+    release(&mut p, id1, false)
+    let (ok3, id3): (bool, u64) = acquire(&mut p, 0x0A000001, 80)
+    print("reuse? id=", id3, " (expect", id1, ")")
+    print("conns=", len(p.conns))
 }
